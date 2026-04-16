@@ -1,0 +1,17 @@
+.{
+    .name = .porcupine,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .fingerprint = 0x315b35e8498dc197,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "examples",
+        "benchmarks",
+        "LICENSE",
+        "README.md",
+    },
+    .dependencies = .{},
+}

@@ -1,0 +1,34 @@
+# Zig distribution (local installation)
+.zig/
+
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Debug files
+*.pdb
+
+# Object files
+*.o
+*.obj
+
+# Executables (uncomment if needed)
+# *.exe
+# *.out
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Test artifacts
+/test-results/
+
+# Dependency lock files (if using package manager)
+# build.zig.zon.lock
