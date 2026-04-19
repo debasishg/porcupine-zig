@@ -59,16 +59,20 @@ const EventKind = types.EventKind;
 // Internal entry representation
 // ---------------------------------------------------------------------------
 
+/// Variant payload: a call carries the `Input`, a return carries the `Output`.
+/// Mirrors `EntryValue<I, O>` in porcupine-rust/src/checker.rs.
+fn EntryValueOf(comptime I: type, comptime O: type) type {
+    return union(enum) {
+        call: I,
+        @"return": O,
+    };
+}
+
 fn EntryOf(comptime I: type, comptime O: type) type {
     return struct {
         id: u32, // operation id (0-indexed); call and return share the same id
         time: u64, // u64 to avoid silent overflow when timestamps are near u64::MAX
-        /// `.input` populated when `is_call == true`; `.output` otherwise.
-        /// A tagged union would be cleaner but this layout keeps `Entry`'s
-        /// total size down to a single cache line for most I/O types.
-        is_call: bool,
-        input: I,
-        output: O,
+        value: EntryValueOf(I, O),
     };
 }
 
@@ -88,16 +92,12 @@ fn makeEntries(
         entries[2 * i] = .{
             .id = @intCast(i),
             .time = op.call,
-            .is_call = true,
-            .input = op.input,
-            .output = undefined,
+            .value = .{ .call = op.input },
         };
         entries[2 * i + 1] = .{
             .id = @intCast(i),
             .time = op.return_time,
-            .is_call = false,
-            .input = undefined,
-            .output = op.output,
+            .value = .{ .@"return" = op.output },
         };
     }
     // Stable-by-time sort — calls precede returns at equal timestamps via a
@@ -105,8 +105,8 @@ fn makeEntries(
     const Cmp = struct {
         fn lessThan(_: void, a: Entry, b: Entry) bool {
             if (a.time != b.time) return a.time < b.time;
-            // calls (is_call=true) < returns (is_call=false) at equal times
-            return a.is_call and !b.is_call;
+            // calls (.call) < returns (.@"return") at equal times
+            return a.value == .call and b.value == .@"return";
         }
     };
     std.mem.sort(Entry, entries, {}, Cmp.lessThan);
@@ -152,16 +152,12 @@ fn convertEntries(
             .call => .{
                 .id = @intCast(ev.id),
                 .time = @intCast(i),
-                .is_call = true,
-                .input = ev.input.?,
-                .output = undefined,
+                .value = .{ .call = ev.input.? },
             },
             .@"return" => .{
                 .id = @intCast(ev.id),
                 .time = @intCast(i),
-                .is_call = false,
-                .input = undefined,
-                .output = ev.output.?,
+                .value = .{ .@"return" = ev.output.? },
             },
         };
     }
@@ -180,11 +176,9 @@ const NONE_REF: u32 = std.math.maxInt(u32);
 
 fn NodeOf(comptime I: type, comptime O: type) type {
     return struct {
-        is_call: bool,
-        /// Set only when `is_call == true`.
-        input: I,
-        /// Set only when `is_call == false`.
-        output: O,
+        /// `null` only for the sentinel at index 0; all real nodes carry a
+        /// payload. Mirrors `Option<EntryValue<I, O>>` in the Rust port.
+        value: ?EntryValueOf(I, O),
         id: u32,
         match_idx: u32, // NONE_REF if not a call node
         prev: u32,
@@ -209,11 +203,9 @@ fn NodeArenaOf(comptime M: type) type {
             const n = entries.len;
             const nodes = try allocator.alloc(Node, n + 1);
 
-            // Sentinel — values never read.
+            // Sentinel — value is null, never dereferenced by DFS.
             nodes[0] = .{
-                .is_call = false,
-                .input = undefined,
-                .output = undefined,
+                .value = null,
                 .id = 0,
                 .match_idx = NONE_REF,
                 .prev = 0,
@@ -228,11 +220,9 @@ fn NodeArenaOf(comptime M: type) type {
             // Allocate a slot for each entry.
             for (entries, 0..) |entry, i| {
                 const idx: u32 = @intCast(i + 1);
-                if (!entry.is_call) try return_idx.put(entry.id, idx);
+                if (entry.value == .@"return") try return_idx.put(entry.id, idx);
                 nodes[idx] = .{
-                    .is_call = entry.is_call,
-                    .input = if (entry.is_call) entry.input else undefined,
-                    .output = if (entry.is_call) undefined else entry.output,
+                    .value = entry.value,
                     .id = entry.id,
                     .match_idx = NONE_REF, // filled below
                     .prev = @intCast(i), // previous index = i (since we're at i+1)
@@ -242,7 +232,7 @@ fn NodeArenaOf(comptime M: type) type {
 
             // Fill match_idx for call nodes in a second pass.
             for (nodes[1..]) |*node| {
-                if (node.is_call) {
+                if (node.value.? == .call) {
                     node.match_idx = return_idx.get(node.id) orelse NONE_REF;
                 }
             }
@@ -494,8 +484,8 @@ fn checkSingle(
             const call_node = &arena.nodes[cursor];
             const ret_node = &arena.nodes[match_raw];
             const op_id: usize = @intCast(call_node.id);
-            const input = &call_node.input;
-            const output = &ret_node.output;
+            const input = &call_node.value.?.call;
+            const output = &ret_node.value.?.@"return";
 
             const next_state_opt = try model.step(arena_alloc, &state, input, output);
             if (next_state_opt) |ns_local| {

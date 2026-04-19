@@ -398,3 +398,57 @@ const byte: u8 = @intCast(value & 0xFF); // known to fit
 - **Rust `as`** = does both, silently truncates if needed
 
 Zig separates these because silent truncation is a common source of bugs. `@as` refuses lossy conversions at compile time; `@intCast` makes you explicitly opt into them.
+
+> Explain the zig idiom in file types.zig, `pub fn Operation`, where instead of a `struct` we    
+  construct a `fn` that returns the struct as a type. Why not `pub const Operation = struct { .. }` ?
+
+The `fn(...) type` pattern: Zig's generics
+                                                                                      
+  ```zig
+  pub fn Operation(comptime I: type, comptime O: type) type {                                
+      return struct { client_id: u64, input: I, output: O, ... };                            
+  }     
+  ```                                                                                     
+                                                                                             
+  This is **how you write a generic type in Zig**. Zig has no `Operation<I, O>` syntax. Types are  
+  first-class `comptime` values, and type is itself a type. So a "generic" is just a function  
+  from types to a type, evaluated at compile time.                                           
+                  
+  **Why not `pub const Operation = struct { ... }` ?**                                              
+   
+  Because a plain `struct` declaration has no way to parameterize `input: I` and `output: O`. The  
+  fields must have concrete types known at that declaration. You'd be forced to pick one —
+  `input: u32` — and every user of the library would be stuck with it.                         
+                  
+  The function form lets each call site pick its own I and O:                                
+   
+  ```zig
+  const RegOp = Operation(RegInput, i32);   // one struct type                               
+  const KvOp  = Operation(KvCmd,   KvResp); // a different struct type        
+  ```               
+                                                                                             
+  Each invocation of `Operation(I, O)` is memoized by Zig: calling it twice with the same      
+  arguments returns the same type (identity by comptime args), so `Operation(u32, i64) == Operation(u32, i64)` holds.                                                                 
+                  
+  **Mental model vs. other languages**
+
+  | Language | Generic               | What it really is                          |
+  |----------|-----------------------|--------------------------------------------|
+  | Rust     | `struct Op<I, O> { }` | Compiler-built parameterized type          |
+  | C++      | `template<...> ...`   | Compiler-built parameterized type          |
+  | Zig      | `fn Op(I, O) type`    | A plain comptime function returning a type |            
+                  
+  Zig exposes the mechanism instead of hiding it behind syntax. The convention: name such a  
+  function in PascalCase (like a type), because semantically it produces one. std does the
+  same — `std.ArrayList(T)`, `std.AutoHashMap(K, V)`, `std.meta.Tuple(...)` are all functions.     
+                  
+  **Bonus: what you can do because it's just a function**                                        
+   
+  - Compute types: `fn Pair(comptime T: type) type { return struct { a: T, b: T }; }`          
+  - Specialize methods inside the returned struct — they close over I/O from the enclosing
+  scope, so `pub fn foo(self: @This(), x: I) O` works naturally.                               
+  - Declare nested public constants like `pub const InputType = I;` (as types.zig does on line
+  37–38) so callers can recover the type parameters: `@TypeOf(op).InputType`.                  
+                  
+  So `pub fn Operation(...)` type isn't a workaround — it's the canonical Zig idiom for        
+  generics, and `pub const Operation = struct { ... }` simply cannot express the same thing.
