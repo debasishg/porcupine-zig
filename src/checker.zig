@@ -79,13 +79,16 @@ fn EntryOf(comptime I: type, comptime O: type) type {
 /// Flatten a slice of `Operation`s into a sorted array of `Entry` pairs.
 /// Calls precede returns at equal timestamps (mirrors Go `byTime` sort).
 ///
-/// The inputs/outputs are memcopied (not cloned) — `Entry` owns a copy as
-/// long as the surrounding arena is alive; the DFS never mutates them.
+/// Entries alias the caller's input/output values (shallow copy by `I`/`O`);
+/// the caller must keep `ops` live for the checker's lifetime. The DFS never
+/// mutates them.
 fn makeEntries(
     comptime M: type,
     allocator: std.mem.Allocator,
     ops: []const Operation(M.Input, M.Output),
 ) std.mem.Allocator.Error![]EntryOf(M.Input, M.Output) {
+    // Node arena indices are u32, so at most (maxInt(u32) - 1) / 2 operations.
+    std.debug.assert(ops.len <= (std.math.maxInt(u32) - 1) / 2);
     const Entry = EntryOf(M.Input, M.Output);
     const entries = try allocator.alloc(Entry, ops.len * 2);
     for (ops, 0..) |op, i| {
@@ -100,8 +103,43 @@ fn makeEntries(
             .value = .{ .@"return" = op.output },
         };
     }
-    // Stable-by-time sort — calls precede returns at equal timestamps via a
-    // secondary key. `std.sort.block` is `O(n log n)` and stable.
+    sortEntriesByTime(M, entries);
+    return entries;
+}
+
+/// Build entries for a partition directly from the full history and an
+/// index list, assigning dense 0-based ids within the partition. Avoids
+/// cloning a sub-history into an intermediate `[]Operation`.
+fn makeEntriesFromIndices(
+    comptime M: type,
+    allocator: std.mem.Allocator,
+    history: []const Operation(M.Input, M.Output),
+    indices: []const usize,
+) std.mem.Allocator.Error![]EntryOf(M.Input, M.Output) {
+    std.debug.assert(indices.len <= (std.math.maxInt(u32) - 1) / 2);
+    const Entry = EntryOf(M.Input, M.Output);
+    const entries = try allocator.alloc(Entry, indices.len * 2);
+    for (indices, 0..) |global_idx, local_id| {
+        const op = history[global_idx];
+        entries[2 * local_id] = .{
+            .id = @intCast(local_id),
+            .time = op.call,
+            .value = .{ .call = op.input },
+        };
+        entries[2 * local_id + 1] = .{
+            .id = @intCast(local_id),
+            .time = op.return_time,
+            .value = .{ .@"return" = op.output },
+        };
+    }
+    sortEntriesByTime(M, entries);
+    return entries;
+}
+
+/// Sort entries by `(time, call-before-return)`. Stability is not required —
+/// the comparator resolves ties explicitly.
+fn sortEntriesByTime(comptime M: type, entries: []EntryOf(M.Input, M.Output)) void {
+    const Entry = EntryOf(M.Input, M.Output);
     const Cmp = struct {
         fn lessThan(_: void, a: Entry, b: Entry) bool {
             if (a.time != b.time) return a.time < b.time;
@@ -109,8 +147,7 @@ fn makeEntries(
             return a.value == .call and b.value == .@"return";
         }
     };
-    std.mem.sort(Entry, entries, {}, Cmp.lessThan);
-    return entries;
+    std.sort.pdq(Entry, entries, {}, Cmp.lessThan);
 }
 
 /// Renumber event ids to be contiguous starting at 0.
@@ -854,10 +891,7 @@ pub fn checkOperations(
             assertPartitionIndependent(@ptrCast(parts));
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
-                const sub = try allocator.alloc(Operation(M.Input, M.Output), indices.len);
-                defer allocator.free(sub);
-                for (indices, 0..) |i, j| sub[j] = history[i];
-                const entries = try makeEntries(M, allocator, sub);
+                const entries = try makeEntriesFromIndices(M, allocator, history, indices);
                 partitions.appendAssumeCapacity(entries);
             }
         } else {
@@ -951,4 +985,122 @@ fn runCheck(
         deadline,
     );
     return toCheckResult(ok, timed_out.load(.monotonic), definitive_illegal.load(.monotonic));
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — makeEntries
+// ---------------------------------------------------------------------------
+
+const TestModel = struct {
+    pub const State = void;
+    pub const Input = u32;
+    pub const Output = u32;
+};
+
+fn tOp(id: u64, input: u32, output: u32, call: u64, ret: u64) Operation(u32, u32) {
+    return .{
+        .client_id = id,
+        .input = input,
+        .output = output,
+        .call = call,
+        .return_time = ret,
+    };
+}
+
+test "makeEntries empty produces no entries" {
+    const allocator = std.testing.allocator;
+    const ops: []const Operation(u32, u32) = &.{};
+    const entries = try makeEntries(TestModel, allocator, ops);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "makeEntries single op produces two entries" {
+    const allocator = std.testing.allocator;
+    const ops = [_]Operation(u32, u32){tOp(0, 1, 0, 5, 15)};
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expect(entries[0].value == .call);
+    try std.testing.expect(entries[1].value == .@"return");
+    try std.testing.expectEqual(@as(u64, 5), entries[0].time);
+    try std.testing.expectEqual(@as(u64, 15), entries[1].time);
+    try std.testing.expectEqual(@as(u32, 0), entries[0].id);
+    try std.testing.expectEqual(@as(u32, 0), entries[1].id);
+}
+
+test "makeEntries call before return at equal timestamps" {
+    const allocator = std.testing.allocator;
+    // Instantaneous op (call == return_time): Call must sort before Return.
+    const ops = [_]Operation(u32, u32){tOp(0, 1, 0, 10, 10)};
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+    try std.testing.expect(entries[0].value == .call);
+    try std.testing.expect(entries[1].value == .@"return");
+}
+
+test "makeEntries time sorted across two ops" {
+    const allocator = std.testing.allocator;
+    // op A: call=5, ret=15   op B: call=0, ret=10
+    // Expected order: CallB(0), CallA(5), RetB(10), RetA(15)
+    const ops = [_]Operation(u32, u32){
+        tOp(0, 1, 0, 5, 15),
+        tOp(1, 2, 0, 0, 10),
+    };
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].time);
+    try std.testing.expectEqual(@as(u64, 5), entries[1].time);
+    try std.testing.expectEqual(@as(u64, 10), entries[2].time);
+    try std.testing.expectEqual(@as(u64, 15), entries[3].time);
+    try std.testing.expect(entries[0].value == .call);
+    try std.testing.expect(entries[1].value == .call);
+    try std.testing.expect(entries[2].value == .@"return");
+    try std.testing.expect(entries[3].value == .@"return");
+}
+
+test "makeEntries large timestamps do not overflow" {
+    const allocator = std.testing.allocator;
+    // Pre-fix Rust bug: timestamps near u64 max were cast to i64 and wrapped.
+    // Zig port uses u64 end-to-end, so this must sort correctly.
+    const t: u64 = std.math.maxInt(u64) - 10;
+    const ops = [_]Operation(u32, u32){
+        tOp(0, 1, 0, t, t + 5),
+        tOp(1, 2, 0, t + 1, t + 6),
+    };
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+    // Expected: CallA(t), CallB(t+1), RetA(t+5), RetB(t+6)
+    try std.testing.expectEqual(@as(u32, 0), entries[0].id);
+    try std.testing.expectEqual(@as(u32, 1), entries[1].id);
+    try std.testing.expect(entries[0].time < entries[1].time);
+    try std.testing.expect(entries[1].time < entries[2].time);
+    try std.testing.expect(entries[2].time < entries[3].time);
+}
+
+test "makeEntriesFromIndices picks subset and renumbers ids" {
+    const allocator = std.testing.allocator;
+    const history = [_]Operation(u32, u32){
+        tOp(0, 10, 0, 0, 5), // global 0
+        tOp(1, 20, 0, 1, 6), // global 1
+        tOp(2, 30, 0, 2, 7), // global 2
+    };
+    const indices = [_]usize{ 0, 2 };
+    const entries = try makeEntriesFromIndices(TestModel, allocator, &history, &indices);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    // Local ids should be 0 and 1 (not the global 0 and 2).
+    // Expected sorted order: Call(g0,t=0), Call(g2,t=2), Ret(g0,t=5), Ret(g2,t=7)
+    try std.testing.expectEqual(@as(u32, 0), entries[0].id);
+    try std.testing.expectEqual(@as(u32, 1), entries[1].id);
+    try std.testing.expectEqual(@as(u32, 0), entries[2].id);
+    try std.testing.expectEqual(@as(u32, 1), entries[3].id);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].time);
+    try std.testing.expectEqual(@as(u64, 2), entries[1].time);
+    try std.testing.expectEqual(@as(u64, 5), entries[2].time);
+    try std.testing.expectEqual(@as(u64, 7), entries[3].time);
+    // Inputs/outputs came from the selected ops.
+    try std.testing.expectEqual(@as(u32, 10), entries[0].value.call);
+    try std.testing.expectEqual(@as(u32, 30), entries[1].value.call);
 }
