@@ -19,9 +19,10 @@
 //!     - Cache prunes duplicate `(bitset, state)` branches (INV-LIN-04).
 //!  6. Return Ok / Illegal (or Unknown if the kill flag fired).
 //!
-//! Parallel partitions run on one thread each (up to CPU-count workers).
-//! A separate timer thread, if a timeout is supplied, fires a kill flag that
-//! all workers poll.
+//! Parallel partitions are dispatched across up to CPU-count worker threads.
+//! Workers pull from a shared atomic index, so having more partitions than
+//! cores doesn't oversubscribe. No separate timer thread — each worker folds
+//! a deadline check into its periodic kill-flag poll.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,7 +35,7 @@ const model_mod = @import("model.zig");
 /// machinery for what amounts to a deadline comparison. Raw `clock_gettime`
 /// costs ~20 ns on Apple Silicon and is called at most once per 4096 DFS
 /// iterations, so the overhead is invisible.
-inline fn nowNs() u64 {
+pub inline fn nowNs() u64 {
     switch (builtin.os.tag) {
         .linux => {
             var ts: std.os.linux.timespec = undefined;
@@ -201,6 +202,47 @@ fn convertEntries(
     return entries;
 }
 
+/// Build entries for a partition directly from the full event history and
+/// an index list, renumbering ids and converting in a single pass. Avoids
+/// the `[]Event` + `[]Event` intermediates the naive chain needs.
+fn convertEntriesFromIndices(
+    comptime M: type,
+    allocator: std.mem.Allocator,
+    history: []const Event(M.Input, M.Output),
+    indices: []const usize,
+) ![]EntryOf(M.Input, M.Output) {
+    const Entry = EntryOf(M.Input, M.Output);
+    const entries = try allocator.alloc(Entry, indices.len);
+    errdefer allocator.free(entries);
+
+    var id_map: std.AutoHashMap(u64, u64) = .init(allocator);
+    defer id_map.deinit();
+    var next_id: u64 = 0;
+
+    for (indices, 0..) |global_idx, local_time| {
+        const ev = history[global_idx];
+        const gop = try id_map.getOrPut(ev.id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = next_id;
+            next_id += 1;
+        }
+        const new_id: u32 = @intCast(gop.value_ptr.*);
+        entries[local_time] = switch (ev.kind) {
+            .call => .{
+                .id = new_id,
+                .time = @intCast(local_time),
+                .value = .{ .call = ev.input.? },
+            },
+            .@"return" => .{
+                .id = new_id,
+                .time = @intCast(local_time),
+                .value = .{ .@"return" = ev.output.? },
+            },
+        };
+    }
+    return entries;
+}
+
 // ---------------------------------------------------------------------------
 // Index-based doubly-linked list (NodeArena)
 //
@@ -233,12 +275,19 @@ fn NodeArenaOf(comptime M: type) type {
         const Self = @This();
 
         /// Build the arena from a sorted entry slice.
+        ///
+        /// Operation ids are dense (0..n_ops), so the call→return mapping
+        /// lives in a plain `[]u32` indexed by id rather than a hashmap.
+        /// For a 170-op history that's one 680-byte allocation instead of
+        /// a hashmap rebuild with per-entry hashing.
         fn fromEntries(
             allocator: std.mem.Allocator,
             entries: []const Entry,
         ) !Self {
             const n = entries.len;
+            const n_ops = n / 2;
             const nodes = try allocator.alloc(Node, n + 1);
+            errdefer allocator.free(nodes);
 
             // Sentinel — value is null, never dereferenced by DFS.
             nodes[0] = .{
@@ -249,15 +298,15 @@ fn NodeArenaOf(comptime M: type) type {
                 .next = if (n > 0) 1 else none_ref,
             };
 
-            // Track which node holds the return for each operation id.
-            var return_idx: std.AutoHashMap(u32, u32) = .init(allocator);
-            defer return_idx.deinit();
-            try return_idx.ensureTotalCapacity(@intCast(n / 2));
+            // `return_idx[op_id]` = node index of that op's return entry.
+            const return_idx = try allocator.alloc(u32, n_ops);
+            defer allocator.free(return_idx);
+            @memset(return_idx, none_ref);
 
-            // Allocate a slot for each entry.
+            // Allocate a slot for each entry and record return-node positions.
             for (entries, 0..) |entry, i| {
                 const idx: u32 = @intCast(i + 1);
-                if (entry.value == .@"return") try return_idx.put(entry.id, idx);
+                if (entry.value == .@"return") return_idx[entry.id] = idx;
                 nodes[idx] = .{
                     .value = entry.value,
                     .id = entry.id,
@@ -270,7 +319,7 @@ fn NodeArenaOf(comptime M: type) type {
             // Fill match_idx for call nodes in a second pass.
             for (nodes[1..]) |*node| {
                 if (node.value.? == .call) {
-                    node.match_idx = return_idx.get(node.id) orelse none_ref;
+                    node.match_idx = return_idx[node.id];
                 }
             }
 
@@ -558,7 +607,16 @@ fn checkSingle(
                         model.deinitState(arena_alloc, &ns);
                         return e;
                     };
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .empty;
+                        // Most buckets hold 1–2 entries — matches Rust's
+                        // `SmallVec<[_;2]>`. Skips the default ArrayList
+                        // first-growth jump of 0 → 8.
+                        gop.value_ptr.ensureTotalCapacity(arena_alloc, 2) catch |e| {
+                            model.deinitState(arena_alloc, &ns);
+                            return e;
+                        };
+                    }
                     gop.value_ptr.append(arena_alloc, .{
                         .linearized = new_linearized,
                         .state = cache_state,
@@ -613,16 +671,19 @@ fn checkSingle(
 /// overhead dominates the work itself.
 const sequential_threshold: usize = 2000;
 
-fn PartitionJobCtx(comptime M: type) type {
+/// Shared per-run state; each worker thread pulls partitions off a common
+/// atomic index. Bounds live-thread count to CPU count regardless of how
+/// many partitions the model produced.
+fn WorkerCtx(comptime M: type) type {
     return struct {
         model: *const M,
-        entries: []const EntryOf(M.Input, M.Output),
+        partitions: [][]const EntryOf(M.Input, M.Output),
+        next_idx: *std.atomic.Value(usize),
         kill: *std.atomic.Value(bool),
         timed_out: *std.atomic.Value(bool),
         definitive_illegal: *std.atomic.Value(bool),
         deadline: ?Deadline,
         result_ok: std.atomic.Value(bool),
-        done: std.atomic.Value(bool),
 
         const Self = @This();
 
@@ -634,34 +695,36 @@ fn PartitionJobCtx(comptime M: type) type {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            if (self.kill.load(.monotonic)) {
-                self.result_ok.store(false, .monotonic);
-                self.done.store(true, .release);
-                return;
-            }
-            const ok = checkSingle(
-                M,
-                alloc,
-                self.model,
-                self.entries,
-                self.kill,
-                self.timed_out,
-                self.deadline,
-            ) catch false;
-            if (!ok) {
-                // Only claim a definitive finding if the kill flag was not
-                // already set (which would mean a sibling or the deadline
-                // aborted us mid-search). There's a benign race here: the
-                // flag may be set between the DFS returning and this load,
-                // which at worst reports Unknown instead of Illegal — the
-                // safe direction.
-                if (!self.kill.load(.monotonic) and !self.timed_out.load(.monotonic)) {
-                    self.definitive_illegal.store(true, .monotonic);
+            while (true) {
+                if (self.kill.load(.monotonic)) return;
+                const idx = self.next_idx.fetchAdd(1, .monotonic);
+                if (idx >= self.partitions.len) return;
+                _ = arena.reset(.retain_capacity);
+
+                const ok = checkSingle(
+                    M,
+                    alloc,
+                    self.model,
+                    self.partitions[idx],
+                    self.kill,
+                    self.timed_out,
+                    self.deadline,
+                ) catch false;
+                if (!ok) {
+                    // Only claim a definitive finding if the kill flag was
+                    // not already set (which would mean a sibling or the
+                    // deadline aborted us mid-search). Benign race: the
+                    // flag may flip between the DFS returning and this load,
+                    // which at worst reports Unknown instead of Illegal —
+                    // the safe direction.
+                    if (!self.kill.load(.monotonic) and !self.timed_out.load(.monotonic)) {
+                        self.definitive_illegal.store(true, .monotonic);
+                    }
+                    self.result_ok.store(false, .monotonic);
+                    self.kill.store(true, .monotonic);
+                    return;
                 }
-                self.kill.store(true, .monotonic);
             }
-            self.result_ok.store(ok, .monotonic);
-            self.done.store(true, .release);
         }
     };
 }
@@ -724,30 +787,37 @@ fn checkParallel(
 
     // ------- Multi-threaded path ------------------------------------------
     // Sort largest-first so the "longest-pole" partition starts immediately
-    // and its worker thread can run the whole time.
+    // and its worker thread can run the whole time. Remaining partitions
+    // trickle in via an atomic work counter, so later workers don't block
+    // on dispatched-but-idle threads.
     std.mem.sort([]const EntryOf(M.Input, M.Output), partitions, {}, struct {
         fn lessThan(_: void, a: []const EntryOf(M.Input, M.Output), b: []const EntryOf(M.Input, M.Output)) bool {
             return a.len > b.len;
         }
     }.lessThan);
 
-    const Ctx = PartitionJobCtx(M);
-    const ctxs = try allocator.alloc(Ctx, partitions.len);
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const n_workers = @min(cpu_count, partitions.len);
+
+    const Ctx = WorkerCtx(M);
+    const ctxs = try allocator.alloc(Ctx, n_workers);
     defer allocator.free(ctxs);
 
-    const threads = try allocator.alloc(std.Thread, partitions.len);
+    const threads = try allocator.alloc(std.Thread, n_workers);
     defer allocator.free(threads);
 
-    for (partitions, ctxs, threads) |part, *ctx, *th| {
+    var next_idx: std.atomic.Value(usize) = .init(0);
+
+    for (ctxs, threads) |*ctx, *th| {
         ctx.* = .{
             .model = model,
-            .entries = part,
+            .partitions = partitions,
+            .next_idx = &next_idx,
             .kill = kill,
             .timed_out = timed_out,
             .definitive_illegal = definitive_illegal,
             .deadline = deadline,
             .result_ok = .init(true),
-            .done = .init(false),
         };
         th.* = try std.Thread.spawn(.{}, Ctx.run, .{ctx});
     }
@@ -944,12 +1014,7 @@ pub fn checkEvents(
             assertPartitionIndependent(@ptrCast(parts));
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
-                const sub = try allocator.alloc(Event(M.Input, M.Output), indices.len);
-                defer allocator.free(sub);
-                for (indices, 0..) |i, j| sub[j] = history[i];
-                const ren = try renumberEvents(M, allocator, sub);
-                defer allocator.free(ren);
-                const entries = try convertEntries(M, allocator, ren);
+                const entries = try convertEntriesFromIndices(M, allocator, history, indices);
                 partitions.appendAssumeCapacity(entries);
             }
         } else {

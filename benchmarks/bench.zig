@@ -100,20 +100,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Warm-up.
     for (0..3) |_| _ = try porcupine.checkOperations(Reg, alloc, &model, history, null);
 
-    const start_ns = blk: {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        break :blk @as(u64, @intCast(@as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec)));
-    };
+    // Use the checker's monotonic clock helper rather than inlining
+    // clock_gettime again — `std.time.nanoTimestamp` is gone in Zig 0.16.
+    const start_ns = porcupine.checker.nowNs();
     for (0..iterations) |_| {
         const res = try porcupine.checkOperations(Reg, alloc, &model, history, null);
         std.debug.assert(res == .ok);
     }
-    const end_ns = blk: {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        break :blk @as(u64, @intCast(@as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec)));
-    };
+    const end_ns = porcupine.checker.nowNs();
     const total_ns = end_ns - start_ns;
     const per_call_ns = total_ns / iterations;
     std.debug.print("total: {d} ns, per-call: {d} ns ({d:.2} us)\n", .{
