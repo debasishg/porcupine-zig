@@ -45,7 +45,8 @@ pub const Bitset = struct {
     }
 
     pub fn deinit(self: *Bitset, allocator: std.mem.Allocator) void {
-        if (self.heap.len > 0) allocator.free(self.heap);
+        // `allocator.free` on an empty slice is a no-op; no guard needed.
+        allocator.free(self.heap);
         self.heap = &.{};
         self.chunks = 0;
     }

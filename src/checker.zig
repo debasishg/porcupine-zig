@@ -156,7 +156,7 @@ fn renumberEvents(
     comptime M: type,
     allocator: std.mem.Allocator,
     events: []const Event(M.Input, M.Output),
-) !struct { []Event(M.Input, M.Output), usize } {
+) ![]Event(M.Input, M.Output) {
     const Ev = Event(M.Input, M.Output);
     const out = try allocator.alloc(Ev, events.len);
     errdefer allocator.free(out);
@@ -173,7 +173,7 @@ fn renumberEvents(
         out[i] = ev;
         out[i].id = gop.value_ptr.*;
     }
-    return .{ out, next_id };
+    return out;
 }
 
 /// Convert a renumbered slice of events into `Entry`s (index used as `time`).
@@ -209,7 +209,7 @@ fn convertEntries(
 // 64-bit and is the single biggest cache-efficiency lever.
 // ---------------------------------------------------------------------------
 
-const NONE_REF: u32 = std.math.maxInt(u32);
+const none_ref: u32 = std.math.maxInt(u32);
 
 fn NodeOf(comptime I: type, comptime O: type) type {
     return struct {
@@ -217,9 +217,9 @@ fn NodeOf(comptime I: type, comptime O: type) type {
         /// payload. Mirrors `Option<EntryValue<I, O>>` in the Rust port.
         value: ?EntryValueOf(I, O),
         id: u32,
-        match_idx: u32, // NONE_REF if not a call node
+        match_idx: u32, // none_ref if not a call node
         prev: u32,
-        next: u32, // NONE_REF if at end
+        next: u32, // none_ref if at end
     };
 }
 
@@ -244,9 +244,9 @@ fn NodeArenaOf(comptime M: type) type {
             nodes[0] = .{
                 .value = null,
                 .id = 0,
-                .match_idx = NONE_REF,
+                .match_idx = none_ref,
                 .prev = 0,
-                .next = if (n > 0) 1 else NONE_REF,
+                .next = if (n > 0) 1 else none_ref,
             };
 
             // Track which node holds the return for each operation id.
@@ -261,16 +261,16 @@ fn NodeArenaOf(comptime M: type) type {
                 nodes[idx] = .{
                     .value = entry.value,
                     .id = entry.id,
-                    .match_idx = NONE_REF, // filled below
+                    .match_idx = none_ref, // filled below
                     .prev = @intCast(i), // previous index = i (since we're at i+1)
-                    .next = if (i + 1 < n) @intCast(i + 2) else NONE_REF,
+                    .next = if (i + 1 < n) @intCast(i + 2) else none_ref,
                 };
             }
 
             // Fill match_idx for call nodes in a second pass.
             for (nodes[1..]) |*node| {
                 if (node.value.? == .call) {
-                    node.match_idx = return_idx.get(node.id) orelse NONE_REF;
+                    node.match_idx = return_idx.get(node.id) orelse none_ref;
                 }
             }
 
@@ -298,37 +298,37 @@ fn NodeArenaOf(comptime M: type) type {
         /// Remove `call_ref` and its matched return node from the live list.
         inline fn lift(self: *Self, call_ref: u32) void {
             const match_idx = self.nodes[call_ref].match_idx;
-            std.debug.assert(match_idx != NONE_REF);
+            std.debug.assert(match_idx != none_ref);
 
             // Unlink call node.
             const call_prev = self.nodes[call_ref].prev;
             const call_next = self.nodes[call_ref].next;
             self.nodes[call_prev].next = call_next;
-            if (call_next != NONE_REF) self.nodes[call_next].prev = call_prev;
+            if (call_next != none_ref) self.nodes[call_next].prev = call_prev;
 
             // Unlink return node.
             const ret_prev = self.nodes[match_idx].prev;
             const ret_next = self.nodes[match_idx].next;
             self.nodes[ret_prev].next = ret_next;
-            if (ret_next != NONE_REF) self.nodes[ret_next].prev = ret_prev;
+            if (ret_next != none_ref) self.nodes[ret_next].prev = ret_prev;
         }
 
         /// Re-insert `call_ref` and its matched return node into the live list.
         inline fn unlift(self: *Self, call_ref: u32) void {
             const match_idx = self.nodes[call_ref].match_idx;
-            std.debug.assert(match_idx != NONE_REF);
+            std.debug.assert(match_idx != none_ref);
 
             // Re-link return node.
             const ret_prev = self.nodes[match_idx].prev;
             const ret_next = self.nodes[match_idx].next;
             self.nodes[ret_prev].next = match_idx;
-            if (ret_next != NONE_REF) self.nodes[ret_next].prev = match_idx;
+            if (ret_next != none_ref) self.nodes[ret_next].prev = match_idx;
 
             // Re-link call node.
             const call_prev = self.nodes[call_ref].prev;
             const call_next = self.nodes[call_ref].next;
             self.nodes[call_prev].next = call_ref;
-            if (call_next != NONE_REF) self.nodes[call_next].prev = call_ref;
+            if (call_next != none_ref) self.nodes[call_next].prev = call_ref;
         }
     };
 }
@@ -490,16 +490,16 @@ fn checkSingle(
     defer model.deinitState(arena_alloc, &state);
 
     var cursor: u32 = arena.headNext();
-    const KILL_POLL_MASK: usize = 4095;
+    const kill_poll_mask: usize = 4095;
     var iter_count: usize = 0;
 
-    while (cursor != NONE_REF) {
+    while (cursor != none_ref) {
         // Poll the kill flag (and, if any, the deadline) every 4096 iterations.
         // Frequent enough that parallel siblings abort within microseconds of
         // a peer finding an illegal history, rare enough that the poll never
         // shows up in hot-path profiles.
         iter_count +%= 1;
-        if ((iter_count & KILL_POLL_MASK) == 0) {
+        if ((iter_count & kill_poll_mask) == 0) {
             if (kill.load(.monotonic)) return false;
             if (deadline) |d| {
                 const now_ns: u64 = nowNs();
@@ -512,7 +512,7 @@ fn checkSingle(
         }
 
         const match_raw = arena.matchOf(cursor);
-        if (match_raw != NONE_REF) {
+        if (match_raw != none_ref) {
             // Call node — candidate for linearization.
             //
             // INV-HIST-03: the live list is always time-sorted, and we
@@ -611,7 +611,7 @@ fn checkSingle(
 /// Rayon-style thread dispatch costs a few microseconds per task; for small
 /// histories (KV c10: ~700 entries across 10 partitions) the dispatch
 /// overhead dominates the work itself.
-const SEQUENTIAL_THRESHOLD: usize = 2000;
+const sequential_threshold: usize = 2000;
 
 fn PartitionJobCtx(comptime M: type) type {
     return struct {
@@ -698,7 +698,7 @@ fn checkParallel(
     // (KV c10 ≈ 700 total entries), the spawn overhead dominates.
     var total_entries: usize = 0;
     for (partitions) |p| total_entries += p.len;
-    if (total_entries < SEQUENTIAL_THRESHOLD) {
+    if (total_entries < sequential_threshold) {
         // Run smallest partitions first: if a small one contains the
         // violation, it finishes fast and the kill broadcast skips the
         // others.
@@ -803,18 +803,23 @@ fn toCheckResult(
 // ---------------------------------------------------------------------------
 
 fn assertWellFormed(comptime M: type, history: []const Operation(M.Input, M.Output)) void {
-    if (@import("builtin").mode != .Debug) return;
+    if (builtin.mode != .Debug) return;
     for (history) |op| {
         std.debug.assert(op.call <= op.return_time);
     }
 }
 
 fn assertWellFormedEvents(comptime M: type, events: []const Event(M.Input, M.Output)) void {
-    if (@import("builtin").mode != .Debug) return;
-    var call_pos: std.AutoHashMap(u64, usize) = .init(std.heap.page_allocator);
-    defer call_pos.deinit();
-    var return_pos: std.AutoHashMap(u64, usize) = .init(std.heap.page_allocator);
-    defer return_pos.deinit();
+    if (builtin.mode != .Debug) return;
+    // Debug-only: if the assert helper itself OOMs on a pathological input,
+    // skip the checks silently rather than crashing a release build's debug
+    // sibling. Under `std.testing.allocator` this never happens.
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var call_pos: std.AutoHashMap(u64, usize) = .init(alloc);
+    var return_pos: std.AutoHashMap(u64, usize) = .init(alloc);
     for (events, 0..) |ev, i| {
         switch (ev.kind) {
             .call => {
@@ -839,9 +844,10 @@ fn assertWellFormedEvents(comptime M: type, events: []const Event(M.Input, M.Out
 }
 
 fn assertPartitionIndependent(parts: []const []const usize) void {
-    if (@import("builtin").mode != .Debug) return;
-    var seen: std.AutoHashMap(usize, void) = .init(std.heap.page_allocator);
-    defer seen.deinit();
+    if (builtin.mode != .Debug) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    var seen: std.AutoHashMap(usize, void) = .init(arena.allocator());
     for (parts) |p| {
         for (p) |idx| {
             const gop = seen.getOrPut(idx) catch return;
@@ -942,20 +948,20 @@ pub fn checkEvents(
                 defer allocator.free(sub);
                 for (indices, 0..) |i, j| sub[j] = history[i];
                 const ren = try renumberEvents(M, allocator, sub);
-                defer allocator.free(ren[0]);
-                const entries = try convertEntries(M, allocator, ren[0]);
+                defer allocator.free(ren);
+                const entries = try convertEntries(M, allocator, ren);
                 partitions.appendAssumeCapacity(entries);
             }
         } else {
             const ren = try renumberEvents(M, allocator, history);
-            defer allocator.free(ren[0]);
-            const entries = try convertEntries(M, allocator, ren[0]);
+            defer allocator.free(ren);
+            const entries = try convertEntries(M, allocator, ren);
             try partitions.append(allocator, entries);
         }
     } else {
         const ren = try renumberEvents(M, allocator, history);
-        defer allocator.free(ren[0]);
-        const entries = try convertEntries(M, allocator, ren[0]);
+        defer allocator.free(ren);
+        const entries = try convertEntries(M, allocator, ren);
         try partitions.append(allocator, entries);
     }
 
