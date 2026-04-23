@@ -322,3 +322,158 @@ test "powerset: coin flip rejects impossible jump" {
     const res = try porcupine.checkOperations(PS, alloc, &m, &history, null);
     try std.testing.expectEqual(CheckResult.illegal, res);
 }
+
+// ---------------------------------------------------------------------------
+// Parallel-path and timeout coverage
+// ---------------------------------------------------------------------------
+
+test "kv: parallel path runs many partitions past the sequential threshold" {
+    // sequential_threshold in checker.zig is 2000 total entries. Build a
+    // history that clears it so checkParallel's multi-threaded branch runs.
+    const alloc = std.testing.allocator;
+    const n_keys: u32 = 10;
+    const per_key: usize = 200; // 10 keys * 200 ops * 2 entries = 4000 entries
+    var history: std.ArrayList(Operation(KVInput, i32)) = .empty;
+    defer history.deinit(alloc);
+    try history.ensureTotalCapacity(alloc, n_keys * per_key);
+    var t: u64 = 0;
+    for (0..n_keys) |k_usize| {
+        const key: u32 = @intCast(k_usize);
+        var last: i32 = 0;
+        for (0..per_key) |i| {
+            const is_write = (i % 2 == 0);
+            if (is_write) {
+                last = @intCast(i + 1);
+                history.appendAssumeCapacity(kvw(key, key, last, t, t + 1));
+            } else {
+                history.appendAssumeCapacity(kvr(key, key, last, t, t + 1));
+            }
+            t += 2;
+        }
+    }
+    const m = KVModel{};
+    const res = try porcupine.checkOperations(KVModel, alloc, &m, history.items, null);
+    try std.testing.expectEqual(CheckResult.ok, res);
+}
+
+test "timeout on a branching history returns ok or unknown, never illegal" {
+    // The unit tests for makeDeadline / Deadline.hasFired cover the
+    // deadline math deterministically. Here we only verify the integration
+    // wiring: a 1 ns timeout on a branching register history must produce
+    // one of the non-.illegal outcomes — never a false positive.
+    const alloc = std.testing.allocator;
+    const n_pairs: usize = 80;
+    var history: std.ArrayList(Operation(RegInput, i32)) = .empty;
+    defer history.deinit(alloc);
+    try history.ensureTotalCapacity(alloc, n_pairs * 2);
+    // Alternating concurrent writes and reads whose observed values
+    // match one of the writes — forces real DFS exploration.
+    for (0..n_pairs) |i| {
+        const v: i32 = @intCast(i + 1);
+        history.appendAssumeCapacity(w(@intCast(i), v, 0, 1_000_000));
+        history.appendAssumeCapacity(r(@intCast(i + n_pairs), v, 0, 1_000_000));
+    }
+    const m = Reg{};
+    const res = try porcupine.checkOperations(Reg, alloc, &m, history.items, 1);
+    try std.testing.expect(res == .ok or res == .unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Event-path partitioning and illegal events
+// ---------------------------------------------------------------------------
+
+test "event-based register: illegal history returns illegal" {
+    const alloc = std.testing.allocator;
+    const m = Reg{};
+    const history = [_]Event(RegInput, i32){
+        .{ .client_id = 1, .kind = .call, .input = .{ .is_write = true, .value = 42 }, .output = null, .id = 0 },
+        .{ .client_id = 1, .kind = .@"return", .input = null, .output = 0, .id = 0 },
+        .{ .client_id = 2, .kind = .call, .input = .{ .is_write = false, .value = 0 }, .output = null, .id = 1 },
+        .{ .client_id = 2, .kind = .@"return", .input = null, .output = 0, .id = 1 }, // read 0 after write 42
+    };
+    const res = try porcupine.checkEvents(Reg, alloc, &m, &history, null);
+    try std.testing.expectEqual(CheckResult.illegal, res);
+}
+
+// KV model variant with a partitionEvents hook — exercises the event-side
+// partition path that previously had no coverage.
+const KVModelEvents = struct {
+    pub const State = i32;
+    pub const Input = KVInput;
+    pub const Output = i32;
+
+    pub fn init(_: *const @This(), _: std.mem.Allocator) !State {
+        return 0;
+    }
+    pub fn step(_: *const @This(), _: std.mem.Allocator, state: *const State, input: *const Input, output: *const Output) !?State {
+        if (input.is_write) return input.value;
+        if (output.* == state.*) return state.*;
+        return null;
+    }
+    pub fn cloneState(_: *const @This(), _: std.mem.Allocator, s: *const State) !State {
+        return s.*;
+    }
+    pub fn deinitState(_: *const @This(), _: std.mem.Allocator, _: *State) void {}
+    pub fn statesEqual(_: *const @This(), a: *const State, b: *const State) bool {
+        return a.* == b.*;
+    }
+    pub fn partitionEvents(
+        _: *const @This(),
+        allocator: std.mem.Allocator,
+        history: []const Event(Input, Output),
+    ) !?[][]usize {
+        if (history.len == 0) return null;
+        var groups: std.AutoHashMap(u32, std.ArrayList(usize)) = .init(allocator);
+        defer {
+            var it = groups.valueIterator();
+            while (it.next()) |v| v.deinit(allocator);
+            groups.deinit();
+        }
+        // Key lives on the .call event; we remember it per event-id so the
+        // matching .@"return" lands in the same partition.
+        var id_to_key: std.AutoHashMap(u64, u32) = .init(allocator);
+        defer id_to_key.deinit();
+        for (history, 0..) |ev, i| {
+            const key: u32 = switch (ev.kind) {
+                .call => blk: {
+                    try id_to_key.put(ev.id, ev.input.?.key);
+                    break :blk ev.input.?.key;
+                },
+                .@"return" => id_to_key.get(ev.id) orelse return null,
+            };
+            const gop = try groups.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(allocator, i);
+        }
+        const out = try allocator.alloc([]usize, groups.count());
+        var written: usize = 0;
+        errdefer {
+            for (out[0..written]) |sl| allocator.free(sl);
+            allocator.free(out);
+        }
+        var it2 = groups.valueIterator();
+        while (it2.next()) |v| {
+            out[written] = try allocator.dupe(usize, v.items);
+            written += 1;
+        }
+        return out;
+    }
+};
+
+test "events: partitioned per-key check catches illegal on one key" {
+    const alloc = std.testing.allocator;
+    const m = KVModelEvents{};
+    // Key 1: legal write/read. Key 2: write 20 then read 99 (illegal).
+    const events = [_]Event(KVInput, i32){
+        .{ .client_id = 1, .kind = .call, .input = .{ .is_write = true, .key = 1, .value = 10 }, .output = null, .id = 0 },
+        .{ .client_id = 1, .kind = .@"return", .input = null, .output = 0, .id = 0 },
+        .{ .client_id = 2, .kind = .call, .input = .{ .is_write = true, .key = 2, .value = 20 }, .output = null, .id = 1 },
+        .{ .client_id = 2, .kind = .@"return", .input = null, .output = 0, .id = 1 },
+        .{ .client_id = 3, .kind = .call, .input = .{ .is_write = false, .key = 1, .value = 0 }, .output = null, .id = 2 },
+        .{ .client_id = 3, .kind = .@"return", .input = null, .output = 10, .id = 2 },
+        .{ .client_id = 4, .kind = .call, .input = .{ .is_write = false, .key = 2, .value = 0 }, .output = null, .id = 3 },
+        .{ .client_id = 4, .kind = .@"return", .input = null, .output = 99, .id = 3 },
+    };
+    const res = try porcupine.checkEvents(KVModelEvents, alloc, &m, &events, null);
+    try std.testing.expectEqual(CheckResult.illegal, res);
+}

@@ -863,8 +863,8 @@ fn toCheckResult(
     definitive_illegal: bool,
 ) CheckResult {
     if (!ok and definitive_illegal) return .illegal;
-    if (timed_out) return .unknown;
     if (ok) return .ok;
+    if (timed_out) return .unknown;
     return .illegal;
 }
 
@@ -1174,4 +1174,147 @@ test "makeEntriesFromIndices picks subset and renumbers ids" {
     // Inputs/outputs came from the selected ops.
     try std.testing.expectEqual(@as(u32, 10), entries[0].value.call);
     try std.testing.expectEqual(@as(u32, 30), entries[1].value.call);
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — renumberEvents / convertEntries / convertEntriesFromIndices
+// ---------------------------------------------------------------------------
+
+fn tCall(id: u64, input: u32, cid: u64) Event(u32, u32) {
+    return .{ .client_id = cid, .kind = .call, .input = input, .output = null, .id = id };
+}
+fn tRet(id: u64, output: u32, cid: u64) Event(u32, u32) {
+    return .{ .client_id = cid, .kind = .@"return", .input = null, .output = output, .id = id };
+}
+
+test "renumberEvents compacts sparse ids" {
+    const allocator = std.testing.allocator;
+    // Two ops with sparse ids (100, 999); expect ids 0 and 1 in first-seen order.
+    const events = [_]Event(u32, u32){
+        tCall(100, 1, 0), tCall(999, 2, 0), tRet(100, 0, 0), tRet(999, 0, 0),
+    };
+    const out = try renumberEvents(TestModel, allocator, &events);
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqual(@as(u64, 0), out[0].id);
+    try std.testing.expectEqual(@as(u64, 1), out[1].id);
+    try std.testing.expectEqual(@as(u64, 0), out[2].id);
+    try std.testing.expectEqual(@as(u64, 1), out[3].id);
+}
+
+test "convertEntries builds entries indexed by position" {
+    const allocator = std.testing.allocator;
+    const events = [_]Event(u32, u32){
+        tCall(0, 7, 0), tRet(0, 7, 0),
+    };
+    const entries = try convertEntries(TestModel, allocator, &events);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].time);
+    try std.testing.expectEqual(@as(u64, 1), entries[1].time);
+    try std.testing.expect(entries[0].value == .call);
+    try std.testing.expect(entries[1].value == .@"return");
+    try std.testing.expectEqual(@as(u32, 7), entries[0].value.call);
+}
+
+test "convertEntriesFromIndices renumbers and picks subset in one pass" {
+    const allocator = std.testing.allocator;
+    const history = [_]Event(u32, u32){
+        tCall(100, 1, 0), // global 0, local time 0, local id 0
+        tCall(200, 2, 0), // global 1 — NOT selected
+        tRet(100, 0, 0), // global 2, local time 1, local id 0
+        tRet(200, 0, 0), // global 3 — NOT selected
+        tCall(300, 3, 0), // global 4, local time 2, local id 1
+        tRet(300, 0, 0), // global 5, local time 3, local id 1
+    };
+    const indices = [_]usize{ 0, 2, 4, 5 };
+    const entries = try convertEntriesFromIndices(TestModel, allocator, &history, &indices);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    // Ids renumbered to local 0-based order.
+    try std.testing.expectEqual(@as(u32, 0), entries[0].id);
+    try std.testing.expectEqual(@as(u32, 0), entries[1].id);
+    try std.testing.expectEqual(@as(u32, 1), entries[2].id);
+    try std.testing.expectEqual(@as(u32, 1), entries[3].id);
+    // Time is the local index.
+    try std.testing.expectEqual(@as(u64, 0), entries[0].time);
+    try std.testing.expectEqual(@as(u64, 3), entries[3].time);
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — NodeArena
+// ---------------------------------------------------------------------------
+
+test "NodeArena.fromEntries wires match_idx correctly" {
+    const allocator = std.testing.allocator;
+    const ops = [_]Operation(u32, u32){
+        tOp(0, 1, 0, 0, 10),
+        tOp(1, 2, 0, 1, 20),
+    };
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+
+    const Arena = NodeArenaOf(TestModel);
+    var arena = try Arena.fromEntries(allocator, entries);
+    defer arena.deinit();
+
+    // Sentinel at 0; 4 entry nodes at 1..=4.
+    try std.testing.expectEqual(@as(usize, 5), arena.nodes.len);
+    try std.testing.expectEqual(@as(u32, 1), arena.headNext());
+
+    // Call nodes should have match_idx pointing at their return.
+    // Sort order: Call0, Call1, Ret0, Ret1 → nodes 1,2,3,4.
+    try std.testing.expectEqual(@as(u32, 3), arena.nodes[1].match_idx); // Call0 → Ret0
+    try std.testing.expectEqual(@as(u32, 4), arena.nodes[2].match_idx); // Call1 → Ret1
+    // Return nodes have none_ref.
+    try std.testing.expectEqual(none_ref, arena.nodes[3].match_idx);
+    try std.testing.expectEqual(none_ref, arena.nodes[4].match_idx);
+}
+
+test "NodeArena lift / unlift round-trip" {
+    const allocator = std.testing.allocator;
+    const ops = [_]Operation(u32, u32){
+        tOp(0, 1, 0, 0, 10),
+        tOp(1, 2, 0, 1, 20),
+    };
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+    const Arena = NodeArenaOf(TestModel);
+    var arena = try Arena.fromEntries(allocator, entries);
+    defer arena.deinit();
+
+    const before_head = arena.headNext();
+    const before_node1_next = arena.nodes[1].next;
+
+    arena.lift(1); // remove Call0 + Ret0
+    // Head should now skip past Call0; Call1 (node 2) should be first.
+    try std.testing.expectEqual(@as(u32, 2), arena.headNext());
+
+    arena.unlift(1); // put them back
+    try std.testing.expectEqual(before_head, arena.headNext());
+    try std.testing.expectEqual(before_node1_next, arena.nodes[1].next);
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — toCheckResult / makeDeadline / Deadline.hasFired
+// ---------------------------------------------------------------------------
+
+test "toCheckResult priority: illegal beats timed_out" {
+    try std.testing.expectEqual(CheckResult.illegal, toCheckResult(false, true, true));
+    try std.testing.expectEqual(CheckResult.unknown, toCheckResult(false, true, false));
+    try std.testing.expectEqual(CheckResult.ok, toCheckResult(true, false, false));
+    try std.testing.expectEqual(CheckResult.illegal, toCheckResult(false, false, false));
+    // ok-with-timeout is still ok (rare race).
+    try std.testing.expectEqual(CheckResult.ok, toCheckResult(true, true, false));
+}
+
+test "makeDeadline / Deadline.hasFired" {
+    try std.testing.expect(makeDeadline(null) == null);
+    const d = makeDeadline(1_000_000_000).?; // 1s from now
+    try std.testing.expect(!d.hasFired(d.deadline_ns - 1));
+    try std.testing.expect(d.hasFired(d.deadline_ns));
+    try std.testing.expect(d.hasFired(d.deadline_ns + 1));
+    // Saturating addition: huge timeout must not wrap.
+    const dsat = makeDeadline(std.math.maxInt(u64)).?;
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), dsat.deadline_ns);
 }

@@ -244,3 +244,58 @@ test "heap spill at 5 chunks" {
     try std.testing.expect(cloned.heap.ptr != b.heap.ptr);
     try std.testing.expect(cloned.eql(&b));
 }
+
+test "eql returns false for different-length bitsets" {
+    const allocator = std.testing.allocator;
+    var a = try Bitset.init(allocator, 64); // 1 chunk
+    defer a.deinit(allocator);
+    var b = try Bitset.init(allocator, 128); // 2 chunks
+    defer b.deinit(allocator);
+    try std.testing.expect(!a.eql(&b));
+}
+
+test "hashWithBit at chunk boundaries" {
+    const allocator = std.testing.allocator;
+    // 3 chunks; probe bits at 63/64/127/128 to exercise boundary math.
+    const positions = [_]usize{ 63, 64, 127, 128 };
+    for (positions) |pos| {
+        var b1 = try Bitset.init(allocator, 192);
+        defer b1.deinit(allocator);
+        b1.set(0);
+        b1.set(100);
+
+        const h_with = b1.hashWithBit(pos);
+
+        var b2 = try b1.clone(allocator);
+        defer b2.deinit(allocator);
+        b2.set(pos);
+
+        try std.testing.expectEqual(b2.hash(), h_with);
+        try std.testing.expect(b1.eqlWithBit(pos, &b2));
+    }
+}
+
+test "n=1 bitset set / clear / hash" {
+    const allocator = std.testing.allocator;
+    var b = try Bitset.init(allocator, 1);
+    defer b.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), b.popcnt());
+    b.set(0);
+    try std.testing.expectEqual(@as(usize, 1), b.popcnt());
+    // hashWithBit + eqlWithBit on the sole bit.
+    var other = try Bitset.init(allocator, 1);
+    defer other.deinit(allocator);
+    other.set(0);
+    try std.testing.expectEqual(b.hash(), other.hash());
+    b.clear(0);
+    try std.testing.expectEqual(@as(usize, 0), b.popcnt());
+}
+
+test "deinit is idempotent" {
+    const allocator = std.testing.allocator;
+    var b = try Bitset.init(allocator, 320); // heap-backed
+    b.deinit(allocator);
+    // Calling deinit again must be a no-op, not a double-free.
+    b.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), b.chunks);
+}

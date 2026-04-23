@@ -273,3 +273,75 @@ fn dedupe(
     }
     return out.toOwnedSlice(allocator);
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Trivial ND model over u32 state, used to exercise dedupe / PowerSetModel
+// without dragging in integration-test fixtures.
+const NdU32 = struct {
+    pub const State = u32;
+    pub const Input = void;
+    pub const Output = u32;
+    pub fn cloneState(_: *const NdU32, _: std.mem.Allocator, s: *const State) !State {
+        return s.*;
+    }
+    pub fn deinitState(_: *const NdU32, _: std.mem.Allocator, _: *State) void {}
+    pub fn statesEqual(_: *const NdU32, a: *const State, b: *const State) bool {
+        return a.* == b.*;
+    }
+};
+
+test "dedupe: empty input returns empty slice" {
+    const alloc = std.testing.allocator;
+    const m = NdU32{};
+    const out = try dedupe(NdU32, &m, alloc, &.{});
+    defer alloc.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "dedupe: removes duplicates and preserves first-occurrence order" {
+    const alloc = std.testing.allocator;
+    const m = NdU32{};
+    const input = [_]u32{ 3, 1, 3, 2, 1, 2 };
+    const out = try dedupe(NdU32, &m, alloc, &input);
+    defer alloc.free(out);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 1, 2 }, out);
+}
+
+test "dedupe: returns a clone independent of the input slice" {
+    const alloc = std.testing.allocator;
+    const m = NdU32{};
+    var input = [_]u32{ 7, 8, 9 };
+    const out = try dedupe(NdU32, &m, alloc, &input);
+    defer alloc.free(out);
+    // Mutating input must not affect the deduped output.
+    input[0] = 99;
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9 }, out);
+}
+
+test "PowerSetModel.statesEqual treats power-states as sets (order-insensitive)" {
+    const PS = PowerSetModel(NdU32);
+    const ps = PS{ .inner = .{} };
+    var a_buf = [_]u32{ 1, 2, 3 };
+    var b_buf = [_]u32{ 3, 1, 2 };
+    var c_buf = [_]u32{ 1, 2, 4 };
+    const a: PS.State = &a_buf;
+    const b: PS.State = &b_buf;
+    const c: PS.State = &c_buf;
+    try std.testing.expect(ps.statesEqual(&a, &b));
+    try std.testing.expect(!ps.statesEqual(&a, &c));
+}
+
+test "PowerSetModel.cloneState / deinitState round-trip" {
+    const alloc = std.testing.allocator;
+    const PS = PowerSetModel(NdU32);
+    const ps = PS{ .inner = .{} };
+    var src_buf = [_]u32{ 10, 20, 30 };
+    const original: PS.State = &src_buf;
+    var cloned = try ps.cloneState(alloc, &original);
+    defer ps.deinitState(alloc, &cloned);
+    try std.testing.expectEqualSlices(u32, original, cloned);
+    try std.testing.expect(cloned.ptr != original.ptr);
+}
