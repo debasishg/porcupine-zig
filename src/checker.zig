@@ -913,17 +913,34 @@ fn assertWellFormedEvents(comptime M: type, events: []const Event(M.Input, M.Out
     }
 }
 
-fn assertPartitionIndependent(parts: []const []const usize) void {
+fn assertPartitionIndependent(parts: []const []const usize, expected_total: usize) void {
     if (builtin.mode != .Debug) return;
-    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
-    defer arena.deinit();
-    var seen: std.AutoHashMap(usize, void) = .init(arena.allocator());
+    // A partitioning of a history of length N must be:
+    //   (a) disjoint — no index appears in two partitions,
+    //   (b) complete — every index in [0, N) appears exactly once,
+    //   (c) in-bounds — every index is < N.
+    //
+    // A single DynamicBitSet of bit_length = N handles all three in O(N)
+    // with one allocation of ~N/8 bytes. The previous AutoHashMap+arena
+    // version only checked (a): it allocated page-sized arena blocks,
+    // hashed each usize, and grew its table as entries were inserted —
+    // and crucially would silently accept a partitioning that dropped
+    // events (violating (b)) or referenced out-of-range indices (violating
+    // (c)). The bitset gives us all three invariants for less work and
+    // less memory.
+    var bits = std.DynamicBitSet.initEmpty(std.heap.smp_allocator, expected_total) catch
+        @panic("OOM in assertPartitionIndependent");
+    defer bits.deinit();
+    var count: usize = 0;
     for (parts) |p| {
         for (p) |idx| {
-            const gop = seen.getOrPut(idx) catch return;
-            std.debug.assert(!gop.found_existing);
+            std.debug.assert(idx < expected_total);
+            std.debug.assert(!bits.isSet(idx));
+            bits.set(idx);
+            count += 1;
         }
     }
+    std.debug.assert(count == expected_total);
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +981,7 @@ pub fn checkOperations(
                 for (parts) |p| allocator.free(p);
                 allocator.free(parts);
             }
-            assertPartitionIndependent(@ptrCast(parts));
+            assertPartitionIndependent(@ptrCast(parts), history.len);
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
                 const entries = try makeEntriesFromIndices(M, allocator, history, indices);
@@ -1011,7 +1028,7 @@ pub fn checkEvents(
                 for (parts) |p| allocator.free(p);
                 allocator.free(parts);
             }
-            assertPartitionIndependent(@ptrCast(parts));
+            assertPartitionIndependent(@ptrCast(parts), history.len);
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
                 const entries = try convertEntriesFromIndices(M, allocator, history, indices);
