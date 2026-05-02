@@ -162,8 +162,14 @@ fn renumberEvents(
     const out = try allocator.alloc(Ev, events.len);
     errdefer allocator.free(out);
 
-    var map: std.AutoHashMap(u64, u64) = .init(allocator);
-    defer map.deinit();
+    // Scratch arena for the transient id-remap hashmap. The map's lifetime
+    // is one function invocation; routing it through an arena turns its
+    // many small allocations into one bulk reclaim and keeps it off the
+    // caller's allocator's free-list.
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    var map: std.AutoHashMap(u64, u64) = .init(scratch.allocator());
+
     var next_id: u64 = 0;
     for (events, 0..) |ev, i| {
         const gop = try map.getOrPut(ev.id);
@@ -265,6 +271,21 @@ fn NodeOf(comptime I: type, comptime O: type) type {
     };
 }
 
+/// Returns a concrete arena type specialised for model `M`.
+///
+/// The arena owns a flat `[]Node` that holds every entry in the linked
+/// linearization list plus a sentinel HEAD node at index 0.  All
+/// inter-node references are stored as `u32` indices into this slice
+/// rather than pointers, so the entire list can be bulk-allocated in a
+/// single `alloc` call and freed with a single `free`.
+///
+/// `fromEntries` builds the arena from a time-sorted `[]Entry` slice:
+/// it sets up `prev`/`next` links for the doubly-linked list and
+/// resolves each call node's `match_idx` to the index of its matching
+/// return node in O(n) time using a temporary `return_idx` lookup array.
+///
+/// Typical lifetime: created once per `checkOperations` / `checkEvents`
+/// call, passed into `doCheck` (the DFS engine), then freed.
 fn NodeArenaOf(comptime M: type) type {
     const Entry = EntryOf(M.Input, M.Output);
     const Node = NodeOf(M.Input, M.Output);
@@ -276,10 +297,16 @@ fn NodeArenaOf(comptime M: type) type {
 
         /// Build the arena from a sorted entry slice.
         ///
-        /// Operation ids are dense (0..n_ops), so the call→return mapping
+        /// Operation ids are dense (0..n_ops), so the call↔return mapping
         /// lives in a plain `[]u32` indexed by id rather than a hashmap.
         /// For a 170-op history that's one 680-byte allocation instead of
         /// a hashmap rebuild with per-entry hashing.
+        ///
+        /// Single-pass: the entry order guarantees a call precedes its
+        /// matching return (calls sort before returns at equal times). So
+        /// when we visit the return, the call's node index is already
+        /// recorded in `call_idx` and we can write its `match_idx` in
+        /// place — no second walk over `nodes` needed.
         fn fromEntries(
             allocator: std.mem.Allocator,
             entries: []const Entry,
@@ -298,28 +325,28 @@ fn NodeArenaOf(comptime M: type) type {
                 .next = if (n > 0) 1 else none_ref,
             };
 
-            // `return_idx[op_id]` = node index of that op's return entry.
-            const return_idx = try allocator.alloc(u32, n_ops);
-            defer allocator.free(return_idx);
-            @memset(return_idx, none_ref);
+            // `call_idx[op_id]` = node index of that op's call entry once
+            // seen; `none_ref` until then.
+            const call_idx = try allocator.alloc(u32, n_ops);
+            defer allocator.free(call_idx);
+            @memset(call_idx, none_ref);
 
-            // Allocate a slot for each entry and record return-node positions.
             for (entries, 0..) |entry, i| {
                 const idx: u32 = @intCast(i + 1);
-                if (entry.value == .@"return") return_idx[entry.id] = idx;
                 nodes[idx] = .{
                     .value = entry.value,
                     .id = entry.id,
-                    .match_idx = none_ref, // filled below
-                    .prev = @intCast(i), // previous index = i (since we're at i+1)
+                    .match_idx = none_ref,
+                    .prev = @intCast(i), // previous index = i (we're at i+1)
                     .next = if (i + 1 < n) @intCast(i + 2) else none_ref,
                 };
-            }
-
-            // Fill match_idx for call nodes in a second pass.
-            for (nodes[1..]) |*node| {
-                if (node.value.? == .call) {
-                    node.match_idx = return_idx[node.id];
+                switch (entry.value) {
+                    .call => call_idx[entry.id] = idx,
+                    .@"return" => {
+                        const c = call_idx[entry.id];
+                        std.debug.assert(c != none_ref); // sort order guarantees it
+                        nodes[c].match_idx = idx;
+                    },
                 }
             }
 
@@ -447,6 +474,13 @@ inline fn cacheContainsWithBit(
     return false;
 }
 
+/// Comptime: does the model opt in to the arena-friendly fast path?
+/// See `model.zig` for the contract — this skips per-entry `deinitState`
+/// walks at partition shutdown, relying on the arena to reclaim memory.
+inline fn isArenaFriendly(comptime M: type) bool {
+    return @hasDecl(M, "arena_friendly") and M.arena_friendly;
+}
+
 // ---------------------------------------------------------------------------
 // DFS call-stack frame
 // ---------------------------------------------------------------------------
@@ -511,8 +545,16 @@ fn checkSingle(
     var linearized = try Bitset.init(arena_alloc, n_ops);
     defer linearized.deinit(arena_alloc);
 
+    // The `arena_friendly` fast path skips per-entry walks below: arena_alloc
+    // is always an ArenaAllocator (per checkParallel), so all bitset and
+    // state memory is reclaimed wholesale by the worker's arena.deinit().
+    // The walks remain for non-arena-friendly models in case `deinitState`
+    // releases something beyond memory.
+
     var cache: Cache = .empty;
-    defer {
+    defer if (comptime isArenaFriendly(M)) {
+        // Arena reclaims the cache buckets and bitset heap-spills.
+    } else {
         var it = cache.iterator();
         while (it.next()) |kv| {
             for (kv.value_ptr.items) |*e| {
@@ -523,20 +565,22 @@ fn checkSingle(
             kv.value_ptr.deinit(arena_alloc);
         }
         cache.deinit(arena_alloc);
-    }
+    };
 
     var calls: std.ArrayList(CallFrame) = .empty;
-    defer {
+    defer if (comptime isArenaFriendly(M)) {
+        // Arena reclaims the backtrack stack and any state copies in it.
+    } else {
         for (calls.items) |*frame| model.deinitState(arena_alloc, &frame.state);
         calls.deinit(arena_alloc);
-    }
+    };
 
     var state = try model.init(arena_alloc);
     // `state` is replaced in place as we descend; on every path (success,
     // failure, or error) we free the *final* live state. Replaced states are
     // either moved onto the backtrack stack (freed with the stack) or
     // dropped in place (this frees them).
-    defer model.deinitState(arena_alloc, &state);
+    defer if (comptime !isArenaFriendly(M)) model.deinitState(arena_alloc, &state);
 
     var cursor: u32 = arena.headNext();
     const kill_poll_mask: usize = 4095;
@@ -576,67 +620,62 @@ fn checkSingle(
             const next_state_opt = try model.step(arena_alloc, &state, input, output);
             if (next_state_opt) |ns_local| {
                 var ns = ns_local;
+                // Single guard for the freshly-stepped state. Replaces the
+                // four catch+deinit blocks the prior version needed to free
+                // `ns` on each fallible step. Flipped to false at the exact
+                // point ownership transfers to either `state` (success) or
+                // the explicit deinit (cache hit).
+                var ns_owned = true;
+                errdefer if (ns_owned) model.deinitState(arena_alloc, &ns);
+
                 // Deferred-clone cache probe — no bitset clone unless we're
                 // about to actually store a new entry.
                 const h = linearized.hashWithBit(op_id);
                 if (!cacheContainsWithBit(M, &cache, model, h, &linearized, op_id, &ns)) {
                     // New `(bitset, state)` pair — commit.
                     //
-                    // Order of operations matters for correctness under OOM:
-                    //   1. clone bitset (may fail) → if it fails, free `ns`.
-                    //   2. clone state   (may fail) → if it fails, free the
-                    //      cloned bitset and `ns`.
-                    //   3. ensure bucket capacity (may fail) → if it fails,
-                    //      free both clones and `ns`.
-                    //   4. push into cache — infallible from here on.
-                    //   5. push calls frame and swap state — also infallible.
-                    var new_linearized = linearized.clone(arena_alloc) catch |e| {
-                        model.deinitState(arena_alloc, &ns);
-                        return e;
-                    };
+                    // OOM-safety strategy:
+                    //   - All fallible work (clones + capacity reservations)
+                    //     happens before any ownership transfer.
+                    //   - The two ownership transfers (cache append, calls
+                    //     append) are infallible `appendAssumeCapacity` calls.
+                    //   - This guarantees the cache and the calls stack stay
+                    //     consistent: nothing is half-inserted on OOM.
+                    var new_linearized = try linearized.clone(arena_alloc);
                     errdefer new_linearized.deinit(arena_alloc);
                     new_linearized.set(op_id);
 
-                    var cache_state = model.cloneState(arena_alloc, &ns) catch |e| {
-                        model.deinitState(arena_alloc, &ns);
-                        return e;
-                    };
+                    var cache_state = try model.cloneState(arena_alloc, &ns);
                     errdefer model.deinitState(arena_alloc, &cache_state);
 
-                    const gop = cache.getOrPut(arena_alloc, h) catch |e| {
-                        model.deinitState(arena_alloc, &ns);
-                        return e;
-                    };
+                    const gop = try cache.getOrPut(arena_alloc, h);
                     if (!gop.found_existing) {
                         gop.value_ptr.* = .empty;
-                        // Most buckets hold 1–2 entries — matches Rust's
-                        // `SmallVec<[_;2]>`. Skips the default ArrayList
-                        // first-growth jump of 0 → 8.
-                        gop.value_ptr.ensureTotalCapacity(arena_alloc, 2) catch |e| {
-                            model.deinitState(arena_alloc, &ns);
-                            return e;
-                        };
+                        // First growth: cap=2 (matches Rust SmallVec<[_;2]>);
+                        // avoids the default ArrayList 0→8 jump.
+                        try gop.value_ptr.ensureTotalCapacity(arena_alloc, 2);
                     }
-                    gop.value_ptr.append(arena_alloc, .{
+                    try gop.value_ptr.ensureUnusedCapacity(arena_alloc, 1);
+                    try calls.ensureUnusedCapacity(arena_alloc, 1);
+
+                    // Infallible from here on — capacity is reserved.
+                    gop.value_ptr.appendAssumeCapacity(.{
                         .linearized = new_linearized,
                         .state = cache_state,
-                    }) catch |e| {
-                        model.deinitState(arena_alloc, &ns);
-                        return e;
-                    };
-
-                    try calls.append(arena_alloc, .{
-                        .node_ref = cursor,
-                        .state = state, // move old state onto backtrack stack
                     });
-                    // `state` has been moved — replace it with `ns`.
+                    calls.appendAssumeCapacity(.{
+                        .node_ref = cursor,
+                        .state = state, // moved onto backtrack stack
+                    });
                     state = ns;
+                    ns_owned = false;
                     linearized.set(op_id);
                     arena.lift(cursor);
                     cursor = arena.headNext();
                 } else {
                     // Already explored this (bitset, state) — skip.
                     model.deinitState(arena_alloc, &ns);
+                    ns_owned = false;
                     cursor = arena.nextOf(cursor);
                 }
             } else {
@@ -674,8 +713,14 @@ const sequential_threshold: usize = 2000;
 /// Shared per-run state; each worker thread pulls partitions off a common
 /// atomic index. Bounds live-thread count to CPU count regardless of how
 /// many partitions the model produced.
+///
+/// The `allocator` is the *backing* allocator for each worker's per-thread
+/// `ArenaAllocator`. It must be safe to call concurrently from multiple
+/// threads — `std.heap.smp_allocator` and `std.testing.allocator` qualify;
+/// `GeneralPurposeAllocator(.{ .thread_safe = false })` does not.
 fn WorkerCtx(comptime M: type) type {
     return struct {
+        allocator: std.mem.Allocator,
         model: *const M,
         partitions: [][]const EntryOf(M.Input, M.Output),
         next_idx: *std.atomic.Value(usize),
@@ -688,10 +733,12 @@ fn WorkerCtx(comptime M: type) type {
         const Self = @This();
 
         fn run(self: *Self) void {
-            // Each worker gets its own arena so DFS allocations never touch
-            // a shared allocator's lock. The arena is released when the
-            // thread function exits.
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            // Each worker owns one ArenaAllocator backed by the caller's
+            // allocator. Routing through the caller (instead of the previous
+            // hard-coded page_allocator) restores leak detection under
+            // std.testing.allocator. Thread-safety of the backing allocator
+            // is the caller's contract — see WorkerCtx doc comment.
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const alloc = arena.allocator();
 
@@ -810,6 +857,7 @@ fn checkParallel(
 
     for (ctxs, threads) |*ctx, *th| {
         ctx.* = .{
+            .allocator = allocator,
             .model = model,
             .partitions = partitions,
             .next_idx = &next_idx,
@@ -879,12 +927,18 @@ fn assertWellFormed(comptime M: type, history: []const Operation(M.Input, M.Outp
     }
 }
 
-fn assertWellFormedEvents(comptime M: type, events: []const Event(M.Input, M.Output)) void {
+fn assertWellFormedEvents(
+    comptime M: type,
+    allocator: std.mem.Allocator,
+    events: []const Event(M.Input, M.Output),
+) void {
     if (builtin.mode != .Debug) return;
     // Debug-only: if the assert helper itself OOMs on a pathological input,
     // skip the checks silently rather than crashing a release build's debug
     // sibling. Under `std.testing.allocator` this never happens.
-    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    // The local arena keeps the bulk-deinit cheap; routing it through the
+    // caller's allocator preserves leak detection.
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
@@ -913,7 +967,11 @@ fn assertWellFormedEvents(comptime M: type, events: []const Event(M.Input, M.Out
     }
 }
 
-fn assertPartitionIndependent(parts: []const []const usize, expected_total: usize) void {
+fn assertPartitionIndependent(
+    allocator: std.mem.Allocator,
+    parts: []const []const usize,
+    expected_total: usize,
+) void {
     if (builtin.mode != .Debug) return;
     // A partitioning of a history of length N must be:
     //   (a) disjoint — no index appears in two partitions,
@@ -928,7 +986,7 @@ fn assertPartitionIndependent(parts: []const []const usize, expected_total: usiz
     // events (violating (b)) or referenced out-of-range indices (violating
     // (c)). The bitset gives us all three invariants for less work and
     // less memory.
-    var bits = std.DynamicBitSet.initEmpty(std.heap.smp_allocator, expected_total) catch
+    var bits = std.DynamicBitSet.initEmpty(allocator, expected_total) catch
         @panic("OOM in assertPartitionIndependent");
     defer bits.deinit();
     var count: usize = 0;
@@ -954,8 +1012,14 @@ fn assertPartitionIndependent(parts: []const []const usize, expected_total: usiz
 /// unbounded check (equivalent to `timeout = 0` in the Go original).
 ///
 /// The `allocator` is used for temporary bookkeeping (partition slices,
-/// entry arrays) but hot-path DFS state is routed through per-worker arena
-/// allocators internally, so this allocator's performance is not critical.
+/// entry arrays) and as the backing allocator for each worker's per-thread
+/// `ArenaAllocator`. When the model declares a `partition` hook and the
+/// resulting work crosses the parallel threshold, the allocator is called
+/// concurrently from multiple worker threads — it must therefore be
+/// thread-safe (`std.heap.smp_allocator`, `std.testing.allocator`, or any
+/// `Allocator` whose vtable serialises internally). Hot-path DFS state goes
+/// through the per-worker arena, so the backing allocator's performance is
+/// not critical.
 pub fn checkOperations(
     comptime M: type,
     allocator: std.mem.Allocator,
@@ -981,7 +1045,7 @@ pub fn checkOperations(
                 for (parts) |p| allocator.free(p);
                 allocator.free(parts);
             }
-            assertPartitionIndependent(@ptrCast(parts), history.len);
+            assertPartitionIndependent(allocator, @ptrCast(parts), history.len);
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
                 const entries = try makeEntriesFromIndices(M, allocator, history, indices);
@@ -1001,9 +1065,9 @@ pub fn checkOperations(
 
 /// Check an event-based history for linearizability.
 ///
-/// Same semantics as `checkOperations`. Each event's `id` links a call to
-/// its matching return; ids are renumbered to be contiguous internally so
-/// large sparse ids cost nothing.
+/// Same semantics and thread-safety contract as `checkOperations`. Each
+/// event's `id` links a call to its matching return; ids are renumbered to
+/// be contiguous internally so large sparse ids cost nothing.
 pub fn checkEvents(
     comptime M: type,
     allocator: std.mem.Allocator,
@@ -1012,7 +1076,7 @@ pub fn checkEvents(
     timeout_ns: ?u64,
 ) !CheckResult {
     model_mod.assertModel(M);
-    assertWellFormedEvents(M, history);
+    assertWellFormedEvents(M, allocator, history);
 
     const Entry = EntryOf(M.Input, M.Output);
 
@@ -1028,7 +1092,7 @@ pub fn checkEvents(
                 for (parts) |p| allocator.free(p);
                 allocator.free(parts);
             }
-            assertPartitionIndependent(@ptrCast(parts), history.len);
+            assertPartitionIndependent(allocator, @ptrCast(parts), history.len);
             try partitions.ensureTotalCapacity(allocator, parts.len);
             for (parts) |indices| {
                 const entries = try convertEntriesFromIndices(M, allocator, history, indices);

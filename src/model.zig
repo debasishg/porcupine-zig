@@ -63,6 +63,20 @@
 //! The `checker` module exposes `hasDecl(M, "partition")` helpers that test
 //! for these optional hooks; models without them are treated as a single
 //! partition.
+//!
+//! # Optional opt-in: `arena_friendly`
+//!
+//!   pub const arena_friendly: bool = true;
+//!
+//! Asserts that `deinitState` is purely memory-cleanup with no other
+//! resources to release (no file handles, sockets, locks, etc.). When set,
+//! the checker skips per-entry `deinitState` walks at partition shutdown,
+//! relying on the per-worker `ArenaAllocator` to reclaim everything in one
+//! call. This is a measurable win when the DFS cache grows large.
+//!
+//! Default (marker absent or false): the checker conservatively walks every
+//! cached / stacked state and calls `deinitState` on it, in case the model
+//! holds resources beyond memory.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -130,6 +144,15 @@ pub fn PowerSetModel(comptime ND: type) type {
 
         pub const Input = ND.Input;
         pub const Output = ND.Output;
+
+        /// PowerSetModel's deinitState only frees memory (per-branch states
+        /// via `inner.deinitState`, then the slice itself). An arena-backed
+        /// allocator reclaims all of it in bulk, so the per-entry walk in
+        /// the checker is redundant for this model. The flag is forwarded
+        /// only when the inner model also opts in — otherwise the inner
+        /// `deinitState` may close real resources.
+        pub const arena_friendly: bool =
+            @hasDecl(ND, "arena_friendly") and ND.arena_friendly;
 
         /// Power-state: the set of concrete states reachable so far.
         /// Stored as a simple slice — owned by the allocator passed to
@@ -200,7 +223,6 @@ pub fn PowerSetModel(comptime ND: type) type {
         ) void {
             for (state.*) |*s| self.inner.deinitState(allocator, s);
             allocator.free(state.*);
-            state.* = &.{};
         }
 
         pub fn statesEqual(self: *const Self, a: *const State, b: *const State) bool {

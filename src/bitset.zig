@@ -19,6 +19,11 @@ const std = @import("std");
 /// 4 * 64 = 256 bits. Keep this at a power of two so `div_ceil(n, 64)` is cheap.
 pub const inline_cap: usize = 4;
 
+/// Bitset is a value type, but copying with `=` is a *shallow alias*: both
+/// copies share the same `heap` slice, and freeing either one invalidates
+/// the other. Use `clone(allocator)` for a deep copy when the bitset may
+/// have spilled to the heap. The DFS in `checker.zig` deliberately holds
+/// bitsets through pointers (`for (entries.items) |*e|`) to avoid this.
 pub const Bitset = struct {
     /// Inline storage for up to `inline_cap * 64` bits.
     inline_buf: [inline_cap]u64,
