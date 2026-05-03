@@ -760,6 +760,104 @@ test "hashmap-kv: OOM at every allocation point does not leak" {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CountingModel — direct gate on Phase 4's cleanup-defer skip.
+//
+// The bench measures the optimization empirically (~2-3% wall-clock at 2k
+// ops). This test pins it at the unit level: a model whose `deinitState`
+// bumps a shared atomic counter, run on a straight-line history that has no
+// in-DFS deinit calls (no cache hits, no pop-stack branches). Under
+// arena_friendly = false the cleanup defers walk the cache + calls + final
+// state and produce a positive count; under arena_friendly = true those
+// walks are comptime-skipped and the count must be exactly zero.
+//
+// If a future change re-introduces a per-entry walk under arena_friendly
+// (or drops the conservative walk under !arena_friendly), this test fires
+// before any other signal.
+// ---------------------------------------------------------------------------
+
+fn CountingModel(comptime is_arena_friendly: bool) type {
+    return struct {
+        const Self = @This();
+        pub const State = []u8;
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub const arena_friendly: bool = is_arena_friendly;
+
+        // Pointer field: model is passed as `*const Self`, so a counter has
+        // to live outside the struct and be reached through indirection.
+        deinit_count: *std.atomic.Value(usize),
+
+        pub fn init(_: *const Self, allocator: std.mem.Allocator) !State {
+            return try allocator.alloc(u8, 0);
+        }
+        pub fn step(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            state: *const State,
+            input: *const Input,
+            output: *const Output,
+        ) !?State {
+            if (output.* != input.*) return null;
+            const next = try allocator.alloc(u8, state.len + 1);
+            @memcpy(next[0..state.len], state.*);
+            next[state.len] = @truncate(input.*);
+            return next;
+        }
+        pub fn cloneState(_: *const Self, allocator: std.mem.Allocator, s: *const State) !State {
+            return try allocator.dupe(u8, s.*);
+        }
+        pub fn deinitState(self: *const Self, allocator: std.mem.Allocator, s: *State) void {
+            allocator.free(s.*);
+            _ = self.deinit_count.fetchAdd(1, .monotonic);
+        }
+        pub fn statesEqual(_: *const Self, a: *const State, b: *const State) bool {
+            return std.mem.eql(u8, a.*, b.*);
+        }
+    };
+}
+
+test "arena_friendly comptime-skips cleanup defers (deinitState count gates)" {
+    const alloc = std.testing.allocator;
+
+    const Slow = CountingModel(false);
+    const Fast = CountingModel(true);
+
+    var slow_count: std.atomic.Value(usize) = .init(0);
+    var fast_count: std.atomic.Value(usize) = .init(0);
+    const slow = Slow{ .deinit_count = &slow_count };
+    const fast = Fast{ .deinit_count = &fast_count };
+
+    // Straight-line history: each call is the unique candidate at its
+    // position. DFS marches forward without branching, so neither the
+    // cache-hit `model.deinitState(&ns)` nor the pop-stack
+    // `model.deinitState(&state)` ever runs. Every deinitState we observe
+    // therefore comes from a cleanup defer.
+    const history = [_]Operation(u32, u32){
+        .{ .client_id = 0, .input = 1, .output = 1, .call = 0, .return_time = 1 },
+        .{ .client_id = 0, .input = 2, .output = 2, .call = 2, .return_time = 3 },
+        .{ .client_id = 0, .input = 3, .output = 3, .call = 4, .return_time = 5 },
+    };
+
+    const slow_res = try porcupine.checkOperations(Slow, alloc, &slow, &history, null);
+    const fast_res = try porcupine.checkOperations(Fast, alloc, &fast, &history, null);
+
+    try std.testing.expectEqual(CheckResult.ok, slow_res);
+    try std.testing.expectEqual(CheckResult.ok, fast_res);
+
+    const slow_n = slow_count.load(.monotonic);
+    const fast_n = fast_count.load(.monotonic);
+
+    // Conservative path: 1 (final state) + 3 (calls frames) + 3 (cache
+    // entries) = 7 expected. Asserting `> 0` keeps the test resilient to
+    // future cleanup-shape changes; the exact value isn't load-bearing.
+    try std.testing.expect(slow_n > 0);
+    // Fast path: zero in-DFS deinit calls + zero cleanup-defer deinit
+    // calls = 0. This is the strict assertion.
+    try std.testing.expectEqual(@as(usize, 0), fast_n);
+}
+
 test "hashmap-kv: cache-pressure stress, both arena_friendly variants" {
     // Pure leak-detection workload at scale: a 500-op sequential history
     // across 4 keys, run under both `arena_friendly = false` (per-entry

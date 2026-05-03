@@ -1291,6 +1291,61 @@ test "renumberEvents compacts sparse ids" {
     try std.testing.expectEqual(@as(u64, 1), out[3].id);
 }
 
+test "renumberEvents pathologies: empty, near-u64-max ids, dense duplicates" {
+    const allocator = std.testing.allocator;
+
+    // Empty input.
+    {
+        const out = try renumberEvents(TestModel, allocator, &.{});
+        defer allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+
+    // ids near u64 max — output ids must be the dense rewrite (0,1,2),
+    // not anything derived from the input ids. Guards against an accidental
+    // pass-through that would silently break NodeArena's dense-index
+    // assumption downstream.
+    {
+        const a = std.math.maxInt(u64);
+        const b = a - 1_000_000;
+        const c = a / 2;
+        const events = [_]Event(u32, u32){
+            tCall(a, 1, 0), tCall(b, 2, 0), tCall(c, 3, 0),
+            tRet(a, 0, 0),  tRet(b, 0, 0),  tRet(c, 0, 0),
+        };
+        const out = try renumberEvents(TestModel, allocator, &events);
+        defer allocator.free(out);
+        try std.testing.expectEqual(@as(u64, 0), out[0].id);
+        try std.testing.expectEqual(@as(u64, 1), out[1].id);
+        try std.testing.expectEqual(@as(u64, 2), out[2].id);
+        try std.testing.expectEqual(@as(u64, 0), out[3].id);
+        try std.testing.expectEqual(@as(u64, 1), out[4].id);
+        try std.testing.expectEqual(@as(u64, 2), out[5].id);
+    }
+
+    // Dense duplicates: 8 events with 4 unique ids in interleaved first-seen
+    // order. Exercises the scratch-arena hashmap's growth path past its
+    // initial bucket count.
+    {
+        const events = [_]Event(u32, u32){
+            tCall(7, 1, 0), tCall(3, 2, 0), tCall(5, 3, 0), tCall(1, 4, 0),
+            tRet(7, 0, 0),  tRet(3, 0, 0),  tRet(5, 0, 0),  tRet(1, 0, 0),
+        };
+        const out = try renumberEvents(TestModel, allocator, &events);
+        defer allocator.free(out);
+        // First-seen order: 7→0, 3→1, 5→2, 1→3.
+        try std.testing.expectEqual(@as(u64, 0), out[0].id);
+        try std.testing.expectEqual(@as(u64, 1), out[1].id);
+        try std.testing.expectEqual(@as(u64, 2), out[2].id);
+        try std.testing.expectEqual(@as(u64, 3), out[3].id);
+        // Returns must reuse the same mapping (not allocate fresh ids).
+        try std.testing.expectEqual(@as(u64, 0), out[4].id);
+        try std.testing.expectEqual(@as(u64, 1), out[5].id);
+        try std.testing.expectEqual(@as(u64, 2), out[6].id);
+        try std.testing.expectEqual(@as(u64, 3), out[7].id);
+    }
+}
+
 test "convertEntries builds entries indexed by position" {
     const allocator = std.testing.allocator;
     const events = [_]Event(u32, u32){
@@ -1358,6 +1413,50 @@ test "NodeArena.fromEntries wires match_idx correctly" {
     // Return nodes have none_ref.
     try std.testing.expectEqual(none_ref, arena.nodes[3].match_idx);
     try std.testing.expectEqual(none_ref, arena.nodes[4].match_idx);
+}
+
+test "NodeArena.fromEntries: interleaved overlapping ops keep call_idx correct" {
+    // Pins the Phase 5.1 single-pass invariant: when a return is processed,
+    // its matching call must already live in `call_idx`. Three ops with
+    // staggered start times produce the entry order CallA, CallB, CallC,
+    // RetA, RetC, RetB — multiple calls in flight before the first return,
+    // and returns out of call-order. If the single pass ever re-orders,
+    // the in-function `assert(c != none_ref)` fires and the test crashes.
+    const allocator = std.testing.allocator;
+    const ops = [_]Operation(u32, u32){
+        tOp(0, 1, 0, 0, 30), // A: call=0, ret=30
+        tOp(1, 2, 0, 5, 50), // B: call=5, ret=50  (returns last)
+        tOp(2, 3, 0, 10, 40), // C: call=10, ret=40 (returns before B)
+    };
+    const entries = try makeEntries(TestModel, allocator, &ops);
+    defer allocator.free(entries);
+
+    // Confirm sort order matches the analysis above (sanity check on the
+    // test fixture, not on fromEntries).
+    try std.testing.expect(entries[0].value == .call and entries[0].id == 0);
+    try std.testing.expect(entries[1].value == .call and entries[1].id == 1);
+    try std.testing.expect(entries[2].value == .call and entries[2].id == 2);
+    try std.testing.expect(entries[3].value == .@"return" and entries[3].id == 0);
+    try std.testing.expect(entries[4].value == .@"return" and entries[4].id == 2);
+    try std.testing.expect(entries[5].value == .@"return" and entries[5].id == 1);
+
+    const Arena = NodeArenaOf(TestModel);
+    var arena = try Arena.fromEntries(allocator, entries);
+    defer arena.deinit();
+
+    // Sentinel + 6 entry nodes (1..6).
+    try std.testing.expectEqual(@as(usize, 7), arena.nodes.len);
+    // Call A (node 1) → Ret A (node 4).
+    try std.testing.expectEqual(@as(u32, 4), arena.nodes[1].match_idx);
+    // Call B (node 2) → Ret B (node 6) — requires call_idx[B] to survive
+    // intact through the intervening Call C, Ret A, Ret C entries.
+    try std.testing.expectEqual(@as(u32, 6), arena.nodes[2].match_idx);
+    // Call C (node 3) → Ret C (node 5).
+    try std.testing.expectEqual(@as(u32, 5), arena.nodes[3].match_idx);
+    // All return nodes carry none_ref.
+    try std.testing.expectEqual(none_ref, arena.nodes[4].match_idx);
+    try std.testing.expectEqual(none_ref, arena.nodes[5].match_idx);
+    try std.testing.expectEqual(none_ref, arena.nodes[6].match_idx);
 }
 
 test "NodeArena lift / unlift round-trip" {
