@@ -1407,3 +1407,106 @@ test "makeDeadline / Deadline.hasFired" {
     const dsat = makeDeadline(std.math.maxInt(u64)).?;
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), dsat.deadline_ns);
 }
+
+// ---------------------------------------------------------------------------
+// Direct OOM-safety test for checkSingle
+// ---------------------------------------------------------------------------
+//
+// Regression guard for the Phase 2 guard-flag refactor (commit 16f76ab).
+// The previous version of checkSingle had a latent ordering bug:
+// `try calls.append` ran *after* `cache.append` had transferred ownership
+// of new_linearized / cache_state into the cache. The corresponding
+// errdefers were still armed — so under a non-arena allocator a calls.append
+// OOM would double-free the cache's now-owned bitset and state.
+//
+// The bug was invisible to every public caller (checkOperations and
+// checkEvents always wrap in ArenaAllocator before calling checkSingle, so
+// `free` is a no-op and the double-free goes unnoticed). The integration-test
+// OOM injection in tests/integration.zig is also blind to it for the same
+// reason. The only way to surface it is to call checkSingle directly with
+// std.testing.allocator — which this test does, exploiting Zig's
+// test-can-see-private-decls rule to avoid widening the public surface.
+//
+// If this test fails after a checkSingle change, suspect that an `errdefer`
+// is staying armed past the point ownership transferred to a long-lived
+// container, or that a fallible `try` slipped in between the `cache.append`
+// and the `state = ns; ns_owned = false` consumption point.
+
+test "checkSingle: OOM at every step is leak-free under non-arena allocator" {
+    const AllocingModel = struct {
+        const Self = @This();
+        // Allocating state — without this the per-entry deinit and the
+        // ownership-transfer paths have nothing to leak.
+        pub const State = []u8;
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub fn init(_: *const Self, allocator: std.mem.Allocator) !State {
+            return try allocator.alloc(u8, 0);
+        }
+        pub fn step(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            state: *const State,
+            input: *const Input,
+            output: *const Output,
+        ) !?State {
+            if (output.* != input.*) return null;
+            const next = try allocator.alloc(u8, state.len + 1);
+            @memcpy(next[0..state.len], state.*);
+            next[state.len] = @truncate(input.*);
+            return next;
+        }
+        pub fn cloneState(_: *const Self, allocator: std.mem.Allocator, s: *const State) !State {
+            return try allocator.dupe(u8, s.*);
+        }
+        pub fn deinitState(_: *const Self, allocator: std.mem.Allocator, s: *State) void {
+            allocator.free(s.*);
+        }
+        pub fn statesEqual(_: *const Self, a: *const State, b: *const State) bool {
+            return std.mem.eql(u8, a.*, b.*);
+        }
+    };
+
+    const Entry = EntryOf(AllocingModel.Input, AllocingModel.Output);
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            // 3-op straight-line history. Sequential timing means each call
+            // is the unique candidate at its position — DFS never branches —
+            // and the cache acquires exactly 3 entries before the run ends.
+            // Enough to exercise every fallible step in checkSingle's commit
+            // sequence (clone bitset, clone state, getOrPut, ensureUnusedCapacity
+            // x2) at least once.
+            const entries = [_]Entry{
+                .{ .id = 0, .time = 0, .value = .{ .call = 1 } },
+                .{ .id = 0, .time = 10, .value = .{ .@"return" = 1 } },
+                .{ .id = 1, .time = 20, .value = .{ .call = 2 } },
+                .{ .id = 1, .time = 30, .value = .{ .@"return" = 2 } },
+                .{ .id = 2, .time = 40, .value = .{ .call = 3 } },
+                .{ .id = 2, .time = 50, .value = .{ .@"return" = 3 } },
+            };
+            const model = AllocingModel{};
+            var kill: std.atomic.Value(bool) = .init(false);
+            var timed_out: std.atomic.Value(bool) = .init(false);
+            // checkSingle either returns true (linearizable, success path)
+            // or propagates error.OutOfMemory. Both must leave testing.allocator
+            // with no outstanding allocations.
+            _ = checkSingle(
+                AllocingModel,
+                allocator,
+                &model,
+                entries[0..],
+                &kill,
+                &timed_out,
+                null,
+            ) catch |e| return e;
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{},
+    );
+}
