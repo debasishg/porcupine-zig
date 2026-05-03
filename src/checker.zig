@@ -1052,12 +1052,16 @@ pub fn checkOperations(
                 partitions.appendAssumeCapacity(entries);
             }
         } else {
+            // Reserve before allocating entries so the append is infallible
+            // — otherwise an OOM in `partitions.append` would leak `entries`.
+            try partitions.ensureTotalCapacity(allocator, 1);
             const entries = try makeEntries(M, allocator, history);
-            try partitions.append(allocator, entries);
+            partitions.appendAssumeCapacity(entries);
         }
     } else {
+        try partitions.ensureTotalCapacity(allocator, 1);
         const entries = try makeEntries(M, allocator, history);
-        try partitions.append(allocator, entries);
+        partitions.appendAssumeCapacity(entries);
     }
 
     return runCheck(M, allocator, model, partitions.items, timeout_ns);
@@ -1099,16 +1103,20 @@ pub fn checkEvents(
                 partitions.appendAssumeCapacity(entries);
             }
         } else {
+            // See checkOperations: reserve before allocating entries so the
+            // append is infallible.
+            try partitions.ensureTotalCapacity(allocator, 1);
             const ren = try renumberEvents(M, allocator, history);
             defer allocator.free(ren);
             const entries = try convertEntries(M, allocator, ren);
-            try partitions.append(allocator, entries);
+            partitions.appendAssumeCapacity(entries);
         }
     } else {
+        try partitions.ensureTotalCapacity(allocator, 1);
         const ren = try renumberEvents(M, allocator, history);
         defer allocator.free(ren);
         const entries = try convertEntries(M, allocator, ren);
-        try partitions.append(allocator, entries);
+        partitions.appendAssumeCapacity(entries);
     }
 
     return runCheck(M, allocator, model, partitions.items, timeout_ns);

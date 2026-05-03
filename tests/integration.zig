@@ -477,3 +477,331 @@ test "events: partitioned per-key check catches illegal on one key" {
     const res = try porcupine.checkEvents(KVModelEvents, alloc, &m, &events, null);
     try std.testing.expectEqual(CheckResult.illegal, res);
 }
+
+// ---------------------------------------------------------------------------
+// HashMap-state KV model — the first allocating model in the test suite.
+//
+// Ports `porcupine-rust/tests/common/mod.rs:67-98`. State is a real
+// `AutoHashMapUnmanaged(u8, i64)` cloned on every `step` and freed on every
+// `deinitState`. Without this fixture the per-entry deinit walk in
+// checker.zig has nothing to free; with it, `std.testing.allocator` can
+// catch leaks across the cache, calls-stack, and live-state paths.
+//
+// Parametrised on `arena_friendly` (Phase 4 opt-in) and `partitioned`
+// (per-key partitioning that exercises the parallel path) so the same body
+// produces all four variants.
+// ---------------------------------------------------------------------------
+
+const HashMapKvInput = struct {
+    key: u8,
+    is_write: bool,
+    value: i64,
+};
+
+fn HashMapKvModel(comptime config: struct {
+    arena_friendly: bool = false,
+    partitioned: bool = false,
+}) type {
+    return struct {
+        const Self = @This();
+
+        pub const State = std.AutoHashMapUnmanaged(u8, i64);
+        pub const Input = HashMapKvInput;
+        pub const Output = i64;
+
+        pub const arena_friendly: bool = config.arena_friendly;
+
+        pub fn init(_: *const Self, _: std.mem.Allocator) !State {
+            return .empty;
+        }
+
+        pub fn step(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            state: *const State,
+            input: *const Input,
+            output: *const Output,
+        ) !?State {
+            // Clone-then-mutate matches the Rust `KvModel.step`. Allocator
+            // is the per-worker arena; the clone is reclaimed in bulk at
+            // partition exit (when arena_friendly) or via the per-entry
+            // deinitState walk otherwise.
+            var next = try state.clone(allocator);
+            errdefer next.deinit(allocator);
+
+            if (input.is_write) {
+                try next.put(allocator, input.key, input.value);
+                return next;
+            }
+            const stored = state.get(input.key) orelse 0;
+            if (output.* == stored) return next;
+            next.deinit(allocator);
+            return null;
+        }
+
+        pub fn cloneState(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            state: *const State,
+        ) !State {
+            return state.clone(allocator);
+        }
+
+        pub fn deinitState(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            state: *State,
+        ) void {
+            state.deinit(allocator);
+        }
+
+        pub fn statesEqual(_: *const Self, a: *const State, b: *const State) bool {
+            if (a.count() != b.count()) return false;
+            var it = a.iterator();
+            while (it.next()) |kv| {
+                const other_v = b.get(kv.key_ptr.*) orelse return false;
+                if (other_v != kv.value_ptr.*) return false;
+            }
+            return true;
+        }
+
+        /// Group operation indices by key. Always defined; returns null
+        /// when the variant is non-partitioned (the checker treats null
+        /// the same as no `partition` decl).
+        pub fn partition(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            history: []const Operation(Input, Output),
+        ) !?[][]usize {
+            if (comptime !config.partitioned) return null;
+            if (history.len == 0) return null;
+
+            var groups: std.AutoHashMap(u8, std.ArrayList(usize)) = .init(allocator);
+            defer {
+                var it = groups.valueIterator();
+                while (it.next()) |v| v.deinit(allocator);
+                groups.deinit();
+            }
+            for (history, 0..) |op, i| {
+                const gop = try groups.getOrPut(op.input.key);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(allocator, i);
+            }
+            const out = try allocator.alloc([]usize, groups.count());
+            var written: usize = 0;
+            errdefer {
+                for (out[0..written]) |sl| allocator.free(sl);
+                allocator.free(out);
+            }
+            var it2 = groups.valueIterator();
+            while (it2.next()) |v| {
+                out[written] = try allocator.dupe(usize, v.items);
+                written += 1;
+            }
+            return out;
+        }
+    };
+}
+
+fn hkw(cid: u64, key: u8, value: i64, call: u64, ret: u64) Operation(HashMapKvInput, i64) {
+    return .{
+        .client_id = cid,
+        .input = .{ .key = key, .is_write = true, .value = value },
+        .call = call,
+        .output = 0,
+        .return_time = ret,
+    };
+}
+fn hkr(cid: u64, key: u8, observed: i64, call: u64, ret: u64) Operation(HashMapKvInput, i64) {
+    return .{
+        .client_id = cid,
+        .input = .{ .key = key, .is_write = false, .value = 0 },
+        .call = call,
+        .output = observed,
+        .return_time = ret,
+    };
+}
+
+test "hashmap-kv: write-then-read sequential is linearizable" {
+    const alloc = std.testing.allocator;
+    const M = HashMapKvModel(.{});
+    const m = M{};
+    const history = [_]Operation(HashMapKvInput, i64){
+        hkw(1, 0, 42, 0, 10),
+        hkr(2, 0, 42, 20, 30),
+    };
+    const res = try porcupine.checkOperations(M, alloc, &m, &history, null);
+    try std.testing.expectEqual(CheckResult.ok, res);
+}
+
+test "hashmap-kv: read of unwritten key returning non-zero is illegal" {
+    const alloc = std.testing.allocator;
+    const M = HashMapKvModel(.{});
+    const m = M{};
+    const history = [_]Operation(HashMapKvInput, i64){
+        hkr(1, 7, 99, 0, 10), // never wrote 99 to key 7
+    };
+    const res = try porcupine.checkOperations(M, alloc, &m, &history, null);
+    try std.testing.expectEqual(CheckResult.illegal, res);
+}
+
+test "hashmap-kv: partitioned per-key, sequential threshold (small)" {
+    // Stays under sequential_threshold (2000 entries). Goes through the
+    // sequential-fallback branch of checkParallel; per-partition state is
+    // a tiny AutoHashMap, and per-entry deinit walks fire if not arena_friendly.
+    const alloc = std.testing.allocator;
+    const M = HashMapKvModel(.{ .partitioned = true });
+    const m = M{};
+    const history = [_]Operation(HashMapKvInput, i64){
+        hkw(1, 1, 10, 0, 10),
+        hkw(2, 2, 20, 0, 10),
+        hkr(3, 1, 10, 20, 30),
+        hkr(4, 2, 20, 20, 30),
+    };
+    const res = try porcupine.checkOperations(M, alloc, &m, &history, null);
+    try std.testing.expectEqual(CheckResult.ok, res);
+}
+
+test "hashmap-kv: partitioned per-key, parallel path (>2000 entries)" {
+    // Exceeds checker.zig's sequential_threshold so the multi-threaded
+    // branch dispatches workers — exercises Phase 3's caller-allocator
+    // routing under testing.allocator across multiple threads.
+    const alloc = std.testing.allocator;
+    const M = HashMapKvModel(.{ .partitioned = true });
+    const m = M{};
+    const n_keys: u8 = 10;
+    const per_key: usize = 200; // 10 * 200 * 2 = 4000 entries
+    var history: std.ArrayList(Operation(HashMapKvInput, i64)) = .empty;
+    defer history.deinit(alloc);
+    try history.ensureTotalCapacity(alloc, n_keys * per_key);
+
+    var t: u64 = 0;
+    var k: u8 = 0;
+    while (k < n_keys) : (k += 1) {
+        var i: usize = 0;
+        var last: i64 = 0;
+        while (i < per_key) : (i += 1) {
+            if (i % 2 == 0) {
+                last = @as(i64, @intCast(k)) * 1000 + @as(i64, @intCast(i));
+                history.appendAssumeCapacity(hkw(1, k, last, t, t + 1));
+            } else {
+                history.appendAssumeCapacity(hkr(1, k, last, t, t + 1));
+            }
+            t += 2;
+        }
+    }
+    const res = try porcupine.checkOperations(M, alloc, &m, history.items, null);
+    try std.testing.expectEqual(CheckResult.ok, res);
+}
+
+test "hashmap-kv: arena_friendly equivalence on illegal history" {
+    // Same illegal history, two model variants. Must agree on the result
+    // and neither must leak under testing.allocator. This is the guard
+    // that the comptime arena_friendly branches don't silently diverge.
+    const alloc = std.testing.allocator;
+    const Slow = HashMapKvModel(.{ .arena_friendly = false });
+    const Fast = HashMapKvModel(.{ .arena_friendly = true });
+    const slow = Slow{};
+    const fast = Fast{};
+    // Two writes to the same key, then a read returning a value that no
+    // single-point linearization could produce: the read overlaps both
+    // writes and observes 1 even though write(2) finished first.
+    const history = [_]Operation(HashMapKvInput, i64){
+        hkw(1, 0, 1, 0, 10),
+        hkw(2, 0, 2, 5, 15),
+        hkr(3, 0, 99, 20, 30),
+    };
+    const res_slow = try porcupine.checkOperations(Slow, alloc, &slow, &history, null);
+    const res_fast = try porcupine.checkOperations(Fast, alloc, &fast, &history, null);
+    try std.testing.expectEqual(res_slow, res_fast);
+    try std.testing.expectEqual(CheckResult.illegal, res_slow);
+}
+
+// OOM fault-injection regression test for the Phase 2 guard-flag refactor
+// (see commit 16f76ab). The previous version of checkSingle had a latent
+// ordering bug: `try calls.append` ran *after* `cache.append` had transferred
+// ownership of `new_linearized` and `cache_state`, but the corresponding
+// errdefers were still armed — so under a non-arena allocator that path would
+// double-free. The bug was invisible under the per-worker ArenaAllocator (free
+// is a no-op there). This test pumps a real allocating model through every
+// possible OOM point and asserts no leak from the failing-allocator harness.
+//
+// The non-partitioned variant is used so only the caller thread runs DFS:
+// avoids thread-safety questions about FailingAllocator under workers.
+test "hashmap-kv: OOM at every allocation point does not leak" {
+    const M = HashMapKvModel(.{});
+    const m = M{};
+    const history = [_]Operation(HashMapKvInput, i64){
+        hkw(1, 0, 1, 0, 10),
+        hkw(2, 1, 2, 5, 15),
+        hkr(3, 0, 1, 20, 30),
+        hkr(4, 1, 2, 25, 35),
+    };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            model_ptr: *const M,
+            hist: []const Operation(HashMapKvInput, i64),
+        ) !void {
+            // Either CheckResult or error.OutOfMemory; both are acceptable —
+            // checkAllAllocationFailures is verifying that no path leaks.
+            _ = porcupine.checkOperations(M, allocator, model_ptr, hist, null) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => return e,
+            };
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{ &m, history[0..] },
+    );
+}
+
+test "hashmap-kv: cache-pressure stress, both arena_friendly variants" {
+    // Pure leak-detection workload at scale: a 500-op sequential history
+    // across 4 keys, run under both `arena_friendly = false` (per-entry
+    // deinitState walk fires) and `arena_friendly = true` (cleanup walks
+    // skipped, arena reclaims). Both must agree on the result and neither
+    // must leak under testing.allocator. With multi-key state, each cached
+    // HashMap holds 4 entries — non-trivial work for the deinit walk in
+    // the conservative path.
+    const alloc = std.testing.allocator;
+    const Slow = HashMapKvModel(.{ .arena_friendly = false });
+    const Fast = HashMapKvModel(.{ .arena_friendly = true });
+    const slow = Slow{};
+    const fast = Fast{};
+
+    const n_ops: usize = 500;
+    const n_keys: u8 = 4;
+    var history: std.ArrayList(Operation(HashMapKvInput, i64)) = .empty;
+    defer history.deinit(alloc);
+    try history.ensureTotalCapacity(alloc, n_ops);
+
+    // Ops come in (write, read) pairs cycling through keys: (w0,r0,w1,r1,
+    // w2,r2,w3,r3,w0,r0,…). Reads observe the value the immediately-prior
+    // write to the same key set, so the history is straight-line
+    // linearizable; the cache grows to ~n_ops entries with multi-key
+    // HashMap states.
+    var t: u64 = 0;
+    var last: [n_keys]i64 = @splat(0);
+    var i: usize = 0;
+    while (i < n_ops) : (i += 1) {
+        const k: u8 = @intCast((i / 2) % n_keys);
+        if (i % 2 == 0) {
+            const v: i64 = @intCast(i + 1);
+            history.appendAssumeCapacity(hkw(1, k, v, t, t + 1));
+            last[k] = v;
+        } else {
+            history.appendAssumeCapacity(hkr(1, k, last[k], t, t + 1));
+        }
+        t += 2;
+    }
+
+    const res_slow = try porcupine.checkOperations(Slow, alloc, &slow, history.items, null);
+    const res_fast = try porcupine.checkOperations(Fast, alloc, &fast, history.items, null);
+    try std.testing.expectEqual(res_slow, res_fast);
+    try std.testing.expectEqual(CheckResult.ok, res_slow);
+}
