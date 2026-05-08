@@ -90,14 +90,23 @@ pub const Bitset = struct {
         return .{ .major = pos / 64, .minor = @intCast(pos % 64) };
     }
 
+    /// Test bit at `pos`. Caller must ensure `pos < chunks * 64`.
+    pub inline fn isSet(self: *const Bitset, pos: usize) bool {
+        std.debug.assert(pos < self.chunks * 64);
+        const ix = index(pos);
+        return (self.data()[ix.major] >> ix.minor) & 1 == 1;
+    }
+
     /// Set bit at `pos`.
     pub inline fn set(self: *Bitset, pos: usize) void {
+        std.debug.assert(pos < self.chunks * 64);
         const ix = index(pos);
         self.dataMut()[ix.major] |= (@as(u64, 1) << ix.minor);
     }
 
     /// Clear bit at `pos`.
     pub inline fn clear(self: *Bitset, pos: usize) void {
+        std.debug.assert(pos < self.chunks * 64);
         const ix = index(pos);
         self.dataMut()[ix.major] &= ~(@as(u64, 1) << ix.minor);
     }
@@ -130,9 +139,15 @@ pub const Bitset = struct {
     /// and no allocation. The Rust port calls this `hash_with_bit`; Go has no
     /// equivalent and pays for the clone on every probe.
     pub inline fn hashWithBit(self: *const Bitset, pos: usize) u64 {
+        std.debug.assert(pos < self.chunks * 64);
         const ix = index(pos);
         const words = self.data();
         const old_word = words[ix.major];
+        // Precondition: bit `pos` must currently be clear. Violating this
+        // makes `old_word == new_word` and the hash transform collapses to a
+        // bare popcnt XOR — the cache key would no longer agree with what
+        // a follow-up `set(pos); hash()` would produce.
+        std.debug.assert((old_word >> ix.minor) & 1 == 0);
         const new_word = old_word | (@as(u64, 1) << ix.minor);
         return self.hash() ^ old_word ^ new_word ^ 1;
     }
@@ -153,10 +168,15 @@ pub const Bitset = struct {
     /// to materialize the mutated bitset — we fabricate the single differing
     /// word on the fly during the comparison loop.
     pub inline fn eqlWithBit(self: *const Bitset, pos: usize, other: *const Bitset) bool {
+        std.debug.assert(pos < self.chunks * 64);
         if (self.chunks != other.chunks) return false;
         const ix = index(pos);
         const a = self.data();
         const b = other.data();
+        // Precondition: bit `pos` must currently be clear in `self`. If it
+        // were already set, the on-the-fly OR below would be a no-op and the
+        // comparison would silently treat `self` as if `pos` were not added.
+        std.debug.assert((a[ix.major] >> ix.minor) & 1 == 0);
         const set_mask = @as(u64, 1) << ix.minor;
         for (a, b, 0..) |x, y, i| {
             const adj = if (i == ix.major) x | set_mask else x;

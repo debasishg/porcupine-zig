@@ -180,6 +180,18 @@ fn renumberEvents(
         out[i] = ev;
         out[i].id = gop.value_ptr.*;
     }
+
+    // Postcondition: ids are dense [0, next_id). Anything looser would break
+    // NodeArena's `call_idx[op_id]` sizing assumption downstream.
+    if (builtin.mode == .Debug) {
+        var max_id: u64 = 0;
+        var any: bool = false;
+        for (out) |ev| {
+            if (!any or ev.id > max_id) max_id = ev.id;
+            any = true;
+        }
+        std.debug.assert(out.len == 0 or max_id == next_id - 1);
+    }
     return out;
 }
 
@@ -311,6 +323,30 @@ fn NodeArenaOf(comptime M: type) type {
             allocator: std.mem.Allocator,
             entries: []const Entry,
         ) !Self {
+            // Each operation contributes exactly one call + one return entry,
+            // so the slice must be even. An odd length would silently truncate
+            // `n_ops` and leave one entry without a matching partner.
+            std.debug.assert(entries.len % 2 == 0);
+
+            // Sort-order precondition: the single-pass match_idx resolution
+            // below assumes calls precede their returns, which the
+            // `sortEntriesByTime` comparator guarantees. Verify in debug so a
+            // future caller that constructs entries by hand can't silently
+            // violate the contract.
+            if (builtin.mode == .Debug) {
+                var i: usize = 1;
+                while (i < entries.len) : (i += 1) {
+                    const a = entries[i - 1];
+                    const b = entries[i];
+                    if (a.time == b.time) {
+                        // Calls must not come *after* returns at equal times.
+                        std.debug.assert(!(a.value == .@"return" and b.value == .call));
+                    } else {
+                        std.debug.assert(a.time < b.time);
+                    }
+                }
+            }
+
             const n = entries.len;
             const n_ops = n / 2;
             const nodes = try allocator.alloc(Node, n + 1);
@@ -373,8 +409,32 @@ fn NodeArenaOf(comptime M: type) type {
 
         /// Remove `call_ref` and its matched return node from the live list.
         inline fn lift(self: *Self, call_ref: u32) void {
+            // Sentinel (slot 0) and out-of-bounds refs are never valid call
+            // targets — the sentinel has match_idx = none_ref and is never
+            // visited as a cursor.
+            std.debug.assert(call_ref != 0);
+            std.debug.assert(call_ref < self.nodes.len);
+            std.debug.assert(self.nodes[call_ref].value != null);
+
             const match_idx = self.nodes[call_ref].match_idx;
             std.debug.assert(match_idx != none_ref);
+
+            // Link-consistency check (debug-only, scoped reads): catches a
+            // double-lift. Reads here are *before* any unlinks; the actual
+            // splice below re-reads the return-side links so that the
+            // adjacent-pair case (call.next == match_idx) sees the updated
+            // prev pointer the call-unlink has just written.
+            if (builtin.mode == .Debug) {
+                const cp = self.nodes[call_ref].prev;
+                const cn = self.nodes[call_ref].next;
+                std.debug.assert(self.nodes[cp].next == call_ref);
+                if (cn != none_ref) std.debug.assert(self.nodes[cn].prev == call_ref);
+
+                const rp = self.nodes[match_idx].prev;
+                const rn = self.nodes[match_idx].next;
+                std.debug.assert(self.nodes[rp].next == match_idx);
+                if (rn != none_ref) std.debug.assert(self.nodes[rn].prev == match_idx);
+            }
 
             // Unlink call node.
             const call_prev = self.nodes[call_ref].prev;
@@ -382,7 +442,10 @@ fn NodeArenaOf(comptime M: type) type {
             self.nodes[call_prev].next = call_next;
             if (call_next != none_ref) self.nodes[call_next].prev = call_prev;
 
-            // Unlink return node.
+            // Unlink return node. ret_prev/ret_next are intentionally read
+            // *after* the call-unlink: when call and return are adjacent,
+            // nodes[match_idx].prev was just updated to call_prev, and the
+            // splice needs that fresh value.
             const ret_prev = self.nodes[match_idx].prev;
             const ret_next = self.nodes[match_idx].next;
             self.nodes[ret_prev].next = ret_next;
@@ -391,6 +454,10 @@ fn NodeArenaOf(comptime M: type) type {
 
         /// Re-insert `call_ref` and its matched return node into the live list.
         inline fn unlift(self: *Self, call_ref: u32) void {
+            std.debug.assert(call_ref != 0);
+            std.debug.assert(call_ref < self.nodes.len);
+            std.debug.assert(self.nodes[call_ref].value != null);
+
             const match_idx = self.nodes[call_ref].match_idx;
             std.debug.assert(match_idx != none_ref);
 
@@ -463,6 +530,12 @@ inline fn cacheContainsWithBit(
     bit_pos: usize,
     state: *const M.State,
 ) bool {
+    // Mirrors the precondition on `Bitset.hashWithBit` / `eqlWithBit`: the
+    // probed bit must be currently clear. The caller in `checkSingle` only
+    // invokes this for op_ids whose call node is still in the live list,
+    // i.e. not yet committed — but assert it here so a future caller can't
+    // silently violate the contract.
+    std.debug.assert(!bs.isSet(bit_pos));
     const entries = cache.getPtr(h) orelse return false;
     for (entries.items) |*e| {
         if (bs.eqlWithBit(bit_pos, &e.linearized) and
@@ -587,6 +660,14 @@ fn checkSingle(
     var iter_count: usize = 0;
 
     while (cursor != none_ref) {
+        // Central DFS invariant: every set bit in `linearized` corresponds to
+        // exactly one frame on the backtrack stack — they are pushed and
+        // popped together. A divergence means a commit or backtrack failed
+        // to update one of the two.
+        if (builtin.mode == .Debug) {
+            std.debug.assert(linearized.popcnt() == calls.items.len);
+        }
+
         // Poll the kill flag (and, if any, the deadline) every 4096 iterations.
         // Frequent enough that parallel siblings abort within microseconds of
         // a peer finding an illegal history, rare enough that the poll never
@@ -687,6 +768,10 @@ fn checkSingle(
             if (calls.items.len == 0) return false;
             const frame = calls.pop().?;
             const call_op_id: usize = @intCast(arena.nodes[frame.node_ref].id);
+            // The bit we're about to clear must currently be set — it was
+            // set when we pushed this frame in the commit branch. Pairs with
+            // the popcnt invariant at the top of the loop.
+            std.debug.assert(linearized.isSet(call_op_id));
             // Restore model state; free the one we were exploring.
             model.deinitState(arena_alloc, &state);
             state = frame.state;
@@ -696,7 +781,10 @@ fn checkSingle(
         }
     }
 
-    // Every operation has been linearized.
+    // Every operation has been linearized — final-state sanity: every op_id
+    // has been committed exactly once, and the calls stack records each.
+    std.debug.assert(linearized.popcnt() == n_ops);
+    std.debug.assert(calls.items.len == n_ops);
     return true;
 }
 
