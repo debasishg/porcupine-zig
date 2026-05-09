@@ -16,6 +16,7 @@ In Zig there's no `const` generics or method overloading like C++ templates, so 
 ### Explicit Error Type: `std.mem.Allocator.Error!Bitset`
 
 **Pros:**
+
 - **API clarity**: Callers know exactly which errors can occur without reading implementation
 - **Documentation**: Self-documenting interface—the signature tells the full story
 - **Compile-time guarantees**: Prevents accidentally leaking unintended errors up the call stack
@@ -23,17 +24,20 @@ In Zig there's no `const` generics or method overloading like C++ templates, so 
 - **Stdlib convention**: Matches idiomatic Zig stdlib patterns, making code consistent
 
 **Cons:**
+
 - **Verbosity**: Longer signatures
 - **Rigidity**: Adding a new error type later requires signature changes (though this is often desirable)
 
 ### Inferred Error Type: `!Bitset`
 
 **Pros:**
+
 - **Flexibility**: Easier to add new error conditions without changing signatures
 - **Brevity**: Shorter function signatures
 - **Composition**: When calling multiple fallible functions, errors automatically propagate without explicit union
 
 **Cons:**
+
 - **Opaque API**: Callers must read implementation or docs to know possible errors
 - **Error leakage**: Easy to accidentally expose internal errors that shouldn't be part of public API
 - **Harder to catch at call site**: `catch |err| switch (err)` becomes harder when error set is unknown
@@ -54,6 +58,7 @@ pub fn init(allocator: std.mem.Allocator, n: usize) std.mem.Allocator.Error!Bits
 ### Recommendation
 
 The stdlib prefers explicit error types because **public APIs benefit from explicit contracts**. Use inferred errors (`!T`) mainly in:
+
 - Private/internal functions
 - Prototyping
 - Functions where the error set genuinely depends on many composed operations
@@ -104,6 +109,7 @@ This guards against someone later adding a `try` between allocation and return. 
 In Zig, `catch unreachable` means "this error can never happen; if it does, it's a bug in my code."
 
 Looking at line 34:
+
 ```zig
 const c = std.math.divCeil(usize, n, 64) catch unreachable;
 ```
@@ -111,6 +117,7 @@ const c = std.math.divCeil(usize, n, 64) catch unreachable;
 `std.math.divCeil` returns an error union because it can fail with `error.DivisionByZero` when the divisor is 0. However, here the divisor is the compile-time constant `64`, which is never zero.
 
 **What `catch unreachable` does:**
+
 - In **Debug/ReleaseSafe** builds: triggers a panic with a stack trace if the error actually occurs—useful for catching logic bugs
 - In **ReleaseFast/ReleaseSmall** builds: the compiler assumes this path is never taken and optimizes accordingly (undefined behavior if violated)
 
@@ -133,6 +140,7 @@ Yes, exactly. Zig makes a deliberate distinction between two categories:
 ### 1. Recoverable Errors → Error Union (`!T`)
 
 Expected failure conditions that callers should handle:
+
 - File not found
 - Network timeout
 - Out of memory
@@ -148,6 +156,7 @@ fn readFile(path: []const u8) ![]u8 {
 ### 2. Bugs/Contract Violations → `unreachable`, `@panic`, assertions
 
 Logic errors that indicate programmer mistakes:
+
 - Invalid invariants
 - Impossible states
 - Violated preconditions

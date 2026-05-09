@@ -5,11 +5,45 @@ representation in `src/checker.zig`. Public API is unaffected.
 
 ## Motivation
 
-The Zig port was ported from `../porcupine-rust/src/checker.rs`. A review of
-the internal representation found that the Zig version had diverged from the
-Rust design in a way that was neither more cache-friendly nor idiomatic — it
-was simply worse on both axes. This note explains the earlier design, why it
-was suboptimal, and what the new design improves.
+This note works through a generic question that comes up when porting Rust to
+Zig: how to translate a Rust `enum` whose variants carry payload. Rust's
+tagged enum has a direct Zig analogue in `union(enum)`, but a flat struct
+with a `bool` (or other) discriminant and per-variant "shadow" payload fields
+is also tempting on the grounds that a uniform layout is simpler or more
+cache-friendly. This case study shows that intuition is wrong on both counts.
+
+The Rust source being ported defined the entry / node representation as
+follows:
+
+```rust
+enum EntryValue<I, O> {
+    Call(I),
+    Return(O),
+}
+
+struct Entry<I, O> {
+    id: usize, // operation id (0-indexed); call and return share the same id
+    time: u64, // u64 to avoid silent overflow when timestamps are near u64::MAX
+    value: EntryValue<I, O>,
+}
+
+// Sentinel HEAD is always at index 0; real nodes occupy indices 1..=2n.
+// `value` is `None` only for the sentinel; always `Some` for real nodes.
+struct Node<I, O> {
+    value: Option<EntryValue<I, O>>,
+    id: u32,
+    match_idx: u32,   // u32::MAX if absent
+    prev: u32,
+    next: u32,        // u32::MAX if absent
+}
+```
+
+A review of the Zig port found that it had diverged from this design —
+collapsing the enum into a `bool` discriminant with two shadow payload
+fields — in a way that was neither more cache-friendly nor idiomatic. The
+sections below explain the earlier Zig design, why it was suboptimal, and
+what the new design (a faithful translation of the Rust enum into
+`union(enum)`, and `Option` into Zig's optional `?T`) improves.
 
 ## Earlier design
 
