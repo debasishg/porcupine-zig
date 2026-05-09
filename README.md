@@ -135,6 +135,12 @@ DFS + memoization, `lift` / `unlift` mechanics, parallel partition dispatch,
 and a fully worked example traced step by step with diagrams of the search
 tree, linked list, and cache.
 
+For Zig-specific implementation patterns, see
+[`docs/zig-feature-idioms.md`](docs/zig-feature-idioms.md) — walks the Status
+bullets below and shows the Zig idiom each feature uses, with source
+pointers — and [`docs/zig-idioms.md`](docs/zig-idioms.md) for general Zig
+craft (error sets, casts, comptime generics, allocator handling).
+
 ## Status
 
 Core features of the Rust port are ported:
