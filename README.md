@@ -12,21 +12,41 @@ concurrent operations is linearizable if the operations can be reordered (while
 respecting their real-time overlap) into a sequential execution that satisfies
 the system's sequential specification.
 
-## Features
+## What it does
 
-- Check linearizability of concurrent operation histories against a sequential
+- Checks linearizability of concurrent operation histories against a sequential
   model.
-- Support for both timestamped `Operation` and raw `Event` (call / return)
-  history formats.
-- Optional timeout-based checking with a tri-state `CheckResult`
-  (`.ok`, `.illegal`, `.unknown`).
+- Accepts both `Operation` (completed call/return pairs with timestamps) and
+  raw `Event` (call / return) history formats — use `Operation` for finished
+  histories, `Event` for streaming or interleaved logs where calls and returns
+  are recorded as they happen.
+- Returns a tri-state `CheckResult` (`.ok`, `.illegal`, `.unknown`) with
+  optional deadline-based timeout.
 - P-compositional checking for partitionable models (e.g. key-value stores
-  partitioned by key).
-- Efficient DFS with backtracking, bitset-based state tracking, and a
-  hash-chained cache keyed by the bitset hash.
+  partitioned by key) — independent partitions run in parallel.
 - `PowerSetModel` wrapper for nondeterministic sequential specifications
   (models with branching step semantics — lossy writes, replica reads,
   internal non-observable choices).
+
+## Why it's fast
+
+- DFS with backtracking, memoized by `(committed_set, model_state)` —
+  equivalent search states are pruned across symmetric orderings.
+- Index-based doubly-linked list (`u32` links instead of pointers) for
+  pending operations — half the size, cache-friendlier walks.
+- SBO bitset, inline up to 256 operations — no heap traffic for small
+  partitions.
+- Deferred-clone cache probing — cache hits never touch the heap
+  (`hashWithBit` / `eqlWithBit` synthesise `set ∪ {bit}` on the fly).
+- Per-partition arena allocator — bulk reclamation, no per-entry frees.
+- Thread-pooled parallel partition dispatch with cooperative cancellation:
+  atomic-counter pickup, sorted largest-first, kill-flag for sibling abort
+  on a found violation.
+
+## Toolchain
+
+Zig 0.16 recommended (minimum 0.15 per `build.zig.zon`). Zero external
+dependencies — pure `build.zig` + stdlib.
 
 ## Quick start
 
@@ -59,15 +79,27 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     const m = Reg{};
-    const history = [_]porcupine.Operation(RegInput, i32){
+    const Op = porcupine.Operation(RegInput, i32);
+
+    // Linearizable: write 42 at [0,10], read 42 at [20,30].
+    const ok_history = [_]Op{
         .{ .client_id = 1, .input = .{ .is_write = true, .value = 42 },
            .call = 0, .output = 0, .return_time = 10 },
         .{ .client_id = 2, .input = .{ .is_write = false, .value = 0 },
            .call = 20, .output = 42, .return_time = 30 },
     };
+    // The trailing `null` is an optional deadline — pass a `*const Deadline`
+    // to bound runtime; `null` means "run to completion".
+    std.debug.assert(try porcupine.checkOperations(Reg, alloc, &m, &ok_history, null) == .ok);
 
-    const res = try porcupine.checkOperations(Reg, alloc, &m, &history, null);
-    std.debug.assert(res == .ok);
+    // Not linearizable: same write, but the read returns 7 instead of 42.
+    const bad_history = [_]Op{
+        .{ .client_id = 1, .input = .{ .is_write = true, .value = 42 },
+           .call = 0, .output = 0, .return_time = 10 },
+        .{ .client_id = 2, .input = .{ .is_write = false, .value = 0 },
+           .call = 20, .output = 7, .return_time = 30 },
+    };
+    std.debug.assert(try porcupine.checkOperations(Reg, alloc, &m, &bad_history, null) == .illegal);
 }
 ```
 
@@ -93,6 +125,16 @@ zig build test -Doptimize=ReleaseFast # run tests with release optimisations
 zig build bench -Doptimize=ReleaseFast -- 100 170   # micro-benchmark
 ```
 
+Indicative numbers under `ReleaseFast`: ~33 µs/check on the 100-op register
+bench, ~46 µs/check on the hashmap bench (see `benchmarks/bench.zig`).
+
+## How it works
+
+See [`docs/algorithm.md`](docs/algorithm.md) for the design doc — covers the
+DFS + memoization, `lift` / `unlift` mechanics, parallel partition dispatch,
+and a fully worked example traced step by step with diagrams of the search
+tree, linked list, and cache.
+
 ## Status
 
 Core features of the Rust port are ported:
@@ -104,12 +146,12 @@ Core features of the Rust port are ported:
 - tri-state `CheckResult` with deadline-based early termination;
 - bitset SBO (small-buffer-optimised up to 256 operations);
 - deferred-clone cache probing (`hashWithBit` + `eqlWithBit`);
-- work-stealing-free parallel partition dispatch (one worker thread per
-  partition, sequential fast path for small workloads under a tunable
-  `SEQUENTIAL_THRESHOLD`).
+- thread-pooled parallel partition dispatch with cooperative cancellation
+  (one worker thread per partition, sequential fast path for small workloads
+  under a tunable `SEQUENTIAL_THRESHOLD`).
 
-Not yet ported: verbose (visualization-producing) entry points, Quint MBT
-integration, the S2 stream / Jepsen-etcd / KV bench fixtures.
+Out of scope for this port: verbose (visualization-producing) entry points,
+Quint MBT integration, S2 stream / Jepsen-etcd / KV bench fixtures.
 
 ## License
 
