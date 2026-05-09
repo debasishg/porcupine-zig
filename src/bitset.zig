@@ -126,27 +126,40 @@ pub const Bitset = struct {
         return h;
     }
 
-    /// Compute the hash that `self` would have if bit `pos` were also set.
-    /// Does not mutate `self`. The caller must guarantee `pos` is currently clear.
+    /// Compute a self-consistent cache key for `self ∪ {pos}` without
+    /// cloning or mutating. The caller must guarantee `pos` is currently clear.
     ///
-    /// # Deferred-clone optimisation
+    /// # Deferred-clone cache probe
     ///
-    /// Setting a bit changes exactly two terms in the hash definition:
-    ///   - popcnt increases by 1 (XOR in 1 into the low bit of `h`).
-    ///   - chunk `major` changes from `old_word` to `new_word`, i.e. XORs in
-    ///     `(old_word ^ new_word)` into `h`.
-    /// So the new hash is `hash ^ old_word ^ new_word ^ 1` — O(1) arithmetic
-    /// and no allocation. The Rust port calls this `hash_with_bit`; Go has no
-    /// equivalent and pays for the clone on every probe.
+    /// Setting bit `pos` mutates one chunk word (`old_word → new_word`),
+    /// which contributes `old_word ^ new_word` to the chunk fold of `hash()`.
+    /// The popcnt seed shifts by `popcnt ^ (popcnt + 1)`, which is `1` only
+    /// when popcnt is even (longer carry chains otherwise).
+    ///
+    /// Returns `hash() ^ old_word ^ new_word ^ 1` — folding in the chunk
+    /// delta and the *even-popcnt* shape of the popcnt delta. Two notes:
+    ///
+    ///   1. This equals `set(pos); hash()` only when popcnt is currently
+    ///      even. For odd predecessors the values differ in the high bits
+    ///      of the popcnt seed.
+    ///   2. The cache calls this at *both* insertion and lookup, so what
+    ///      matters is *self-consistency*: any two probes that would land
+    ///      on the same `(set, state)` entry have equal predecessor popcnts
+    ///      and equal post-set chunks, so they agree here for every parity.
+    ///      That is the property the algorithm depends on.
+    ///
+    /// Cost: one chunk walk via `self.hash()` plus three XORs. The hot-path
+    /// saving comes from deferring the clone and the bit-set, not from
+    /// skipping the chunk walk. The Rust port calls this `hash_with_bit`;
+    /// Go pays the clone on every probe.
     pub inline fn hashWithBit(self: *const Bitset, pos: usize) u64 {
         std.debug.assert(pos < self.chunks * 64);
         const ix = index(pos);
         const words = self.data();
         const old_word = words[ix.major];
         // Precondition: bit `pos` must currently be clear. Violating this
-        // makes `old_word == new_word` and the hash transform collapses to a
-        // bare popcnt XOR — the cache key would no longer agree with what
-        // a follow-up `set(pos); hash()` would produce.
+        // makes `old_word == new_word` and the chunk delta collapses to 0,
+        // breaking self-consistency between insertion and lookup.
         std.debug.assert((old_word >> ix.minor) & 1 == 0);
         const new_word = old_word | (@as(u64, 1) << ix.minor);
         return self.hash() ^ old_word ^ new_word ^ 1;
@@ -229,18 +242,66 @@ test "clone is independent" {
     try std.testing.expectEqual(@as(usize, 2), b2.popcnt());
 }
 
-test "hash_with_bit matches hash after set" {
+test "hashWithBit matches hash after set when predecessor popcnt is even" {
+    // The formula `hash() ^ old ^ new ^ 1` equals `set(p); hash()` exactly
+    // when popcnt is currently even (so the popcnt delta is 1). For odd
+    // predecessors the values differ — see the next test for the property
+    // the cache actually relies on.
     const allocator = std.testing.allocator;
     var b1 = try Bitset.init(allocator, 300); // 5 chunks -> heap spill
     defer b1.deinit(allocator);
     b1.set(1);
-    b1.set(200);
+    b1.set(200); // popcnt = 2 (even)
     const h_with = b1.hashWithBit(150);
 
     var b2 = try b1.clone(allocator);
     defer b2.deinit(allocator);
     b2.set(150);
     try std.testing.expectEqual(b2.hash(), h_with);
+}
+
+test "hashWithBit is consistent across equivalent predecessors" {
+    // The cache's correctness depends on this property: two probes that
+    // would commit to the same final `(set, state)` entry must compute the
+    // same lookup key. Holds for every popcnt parity, even though
+    // equivalence to `set(p); hash()` does not.
+    const allocator = std.testing.allocator;
+
+    // Even predecessor popcnt (2). b1 = {1, 200} probes 150; b2 = {1, 150}
+    // probes 200. Both predecessors have popcnt 2, both post-set bitsets
+    // are {1, 150, 200}.
+    {
+        var b1 = try Bitset.init(allocator, 300);
+        defer b1.deinit(allocator);
+        b1.set(1);
+        b1.set(200);
+
+        var b2 = try Bitset.init(allocator, 300);
+        defer b2.deinit(allocator);
+        b2.set(1);
+        b2.set(150);
+
+        try std.testing.expectEqual(b1.hashWithBit(150), b2.hashWithBit(200));
+    }
+
+    // Odd predecessor popcnt (3). This is the case where `hashWithBit(p)`
+    // does NOT equal `clone(b).set(p).hash()` — but the two probes still
+    // agree on the lookup key, which is what the cache requires.
+    {
+        var b1 = try Bitset.init(allocator, 300);
+        defer b1.deinit(allocator);
+        b1.set(1);
+        b1.set(50);
+        b1.set(200);
+
+        var b2 = try Bitset.init(allocator, 300);
+        defer b2.deinit(allocator);
+        b2.set(1);
+        b2.set(50);
+        b2.set(150);
+
+        try std.testing.expectEqual(b1.hashWithBit(150), b2.hashWithBit(200));
+    }
 }
 
 test "eql_with_bit matches eql after set" {
