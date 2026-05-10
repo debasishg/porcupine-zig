@@ -549,3 +549,158 @@ Zig exposes the mechanism instead of hiding it behind syntax. The convention: na
 - Declare nested public constants like `pub const InputType = I;` so callers can recover the type parameters: `@TypeOf(op).InputType`.
 
 So `pub fn Operation(...)` type isn't a workaround — it's the canonical Zig idiom for generics, and `pub const Operation = struct { ... }` simply cannot express the same thing.
+
+### `@This()` closes the loop
+
+Methods inside the returned struct often need to name the enclosing type for return values, parameters, and self-pointers. The canonical binding is `const Self = @This()`:
+
+```zig
+fn NodeArenaOf(comptime M: type) type {
+    const Entry = EntryOf(M.Input, M.Output);   // derived types
+    const Node  = NodeOf(M.Input, M.Output);
+    return struct {
+        nodes: []Node,
+        allocator: std.mem.Allocator,
+        const Self = @This();                   // refer back to the type
+        fn fromEntries(...) !Self { ... }
+    };
+}
+```
+
+The function is a **type constructor** — a comptime factory that mints a fresh, fully concrete struct per `M`. By the time the linker sees the binary, `NodeArenaOf(RegisterModel)` is just an ordinary monomorphic struct with no generics left.
+
+### Where porcupine-zig uses it
+
+- `NodeOf(I, O)` — `src/checker.zig:274`. Single struct shape parameterized over the input/output payload types of one model.
+- `NodeArenaOf(M)` — `src/checker.zig:301`. The doubly-linked list arena, carrying its `[]Node` allocation.
+- `EntryOf(I, O)` and `EntryValueOf(I, O)` — `src/types.zig`. The flattened `(call|return)` events the DFS walks.
+- `CacheOf(M)` — `src/checker.zig:435`. The `(linearized, state)` memo cache.
+- `WorkerCtx(M)` — `src/checker.zig:809`. Per-worker thread context.
+- `PowerSetModelOf(...)` — `src/model.zig`. Wraps an inner model into one whose state is a slice of inner states.
+
+Every public entry point (`checkOperations`, `checkEvents`, `PowerSetModel`) is parameterized this way, and the comptime `M` flows down through every internal helper that needs to know the model's `Input`/`Output`/`State`.
+
+### Pros
+
+- **Full monomorphization.** No v-tables, no boxing, no type erasure. The `[]Node` is laid out with the exact `Node` size for `M`; `fromEntries` is inlined and specialized. Performance is identical to handwriting one `NodeArena` per model.
+- **Type safety across instantiations.** You can't pass a `NodeArenaOf(A)` to a function expecting `NodeArenaOf(B)` — they're unrelated types. The mistake is caught at compile time, not via runtime tag checks.
+- **Zero runtime dispatch cost.** `model.step(...)` calls in `checkSingle` resolve to direct calls; the comptime `M` parameter means the compiler knows the exact function at every call site. Crucial for the hot path — see the perf notes in `CLAUDE.md`.
+- **Comptime specialization.** You can branch on `@sizeOf(M.State)`, `@hasDecl(M, "partition")`, etc. inside the type constructor and emit different code per `M`. The checker uses this to opt into the `arena_friendly` cleanup fast path when the model exposes the marker (see `docs/allocation-idioms.md` §3.2).
+- **Derived types compose naturally.** `EntryOf(M.Input, M.Output)` and `NodeOf(M.Input, M.Output)` are computed once at the top of `NodeArenaOf` and used throughout. No template-template-parameter gymnastics.
+
+### Cons
+
+- **Code bloat.** Each instantiation emits a fresh copy of every method. A binary that checks N different models pays N× the code size for `NodeArenaOf`, `checkSingle`, the cache, the bitset hooks, etc. Usually fine — the checker is small — but it adds up if you instantiate generics liberally.
+- **Compile-time cost.** Comptime evaluation isn't free; deep generic chains slow `zig build`. Less of an issue here because the model surface is shallow (a handful of decls), but a stdlib-grade hashmap with many comptime knobs noticeably affects build time.
+- **Error messages surface at the instantiation site.** If `M` is missing `cloneState`, the error appears wherever `NodeArenaOf(MyModel)` is *used*, often with a chain of "called from here" frames. Less ergonomic than a constraint-style error ("`MyModel` does not implement `Model`"). The model-contract doc comment in `src/model.zig` partially compensates by enumerating the required decls in one place.
+- **No partial type erasure.** If you genuinely need to store `NodeArenaOf(A)` and `NodeArenaOf(B)` in one container, the comptime approach gives you nothing — you'd have to hand-roll a v-table struct (function pointers + opaque state pointer). Zig deliberately makes this opt-in rather than free.
+- **Debug binaries bloat.** Each instantiation gets its own debug info, with type names like `checker.NodeArenaOf(register.RegisterModel).fromEntries`. Not a correctness issue, but `objdump` output becomes long.
+- **No comptime "inheritance."** If two type constructors share most of a struct, you can't reuse the body — you either pass the inner struct as a field or paste the fields. Zig's answer is composition, not inheritance, but it does mean some duplication you'd avoid in C++/Rust.
+
+### When to use it vs. alternatives
+
+The type-constructor idiom is the right tool when:
+
+- The type carries **per-`T` state** (a `[]Node` sized for `M`'s payload, a state field of type `M.State`).
+- The hot path **calls into `T`** (e.g., `model.step` in `checkSingle`) and you want those calls direct, not indirect.
+- Distinct instantiations should be **distinct types** at the type level — passing a `NodeArenaOf(A)` to a function expecting `NodeArenaOf(B)` should be a compile error.
+
+Reach for something else when:
+
+- **You only need a free function with a generic parameter.** Just take `anytype` or a comptime `T`. Don't wrap the function in a type constructor for ceremony's sake. `sortEntriesByTime` (`src/checker.zig:142`) takes `comptime M: type` directly because it has no state, just code.
+- **You need runtime polymorphism over heterogeneous instances.** Hand-roll a v-table struct: a struct of function pointers plus an `*anyopaque` state pointer. The cost is one indirect call per dispatch, which is fine outside a tight DFS hot path. The Zig stdlib does this for `std.mem.Allocator` itself — the v-table is in the allocator interface precisely because allocators must be substitutable at runtime.
+- **The shared shape is tiny and the per-`T` parts are large.** A type constructor would emit one big monomorphized blob per `T` when most of the code wasn't generic to begin with. Pull the generic part out into its own constructor and keep the rest as ordinary functions.
+
+### Why it fits porcupine-zig
+
+For `NodeArenaOf` and the rest of the checker's internals, the trade hits the sweet spot:
+
+- The DFS is hot enough that monomorphized `model.step`, right-sized `Node`, and inlined cache probes matter.
+- The checker only instantiates a handful of models per binary (register, KV, etc.), so code bloat is bounded.
+- The type-safety benefit lines up with the algorithm's invariants: a `NodeArenaOf(A)` cannot leak into a `checkSingle` parameterized on `B`, because the parameter type would not match.
+- Comptime specialization is load-bearing for the `arena_friendly` cleanup path — the slow walk and the fast skip live in the same source but only one is emitted per `M`.
+
+For runtime-polymorphic work — multiple models in one container, dynamic model selection — porcupine-zig would need a v-table layer. It doesn't, because no caller has asked for it. The current design is one of the reasons the checker stays fast.
+
+## 8. Heavy invariants: `if (builtin.mode == .Debug)` vs. bare `std.debug.assert`
+
+Zig has two ways to assert a debug-only invariant. They look interchangeable but aren't:
+
+```zig
+// (a) Bare assert
+std.debug.assert(linearized.popcnt() == calls.items.len);
+
+// (b) Comptime-guarded assert
+if (builtin.mode == .Debug) {
+    std.debug.assert(linearized.popcnt() == calls.items.len);
+}
+```
+
+In `checker.zig`, the central DFS coupling at `:667` is form (b). It looks like over-engineering — surely `std.debug.assert` already handles the modes? — but two specific properties of `std.debug.assert` make the guard load-bearing.
+
+### What `std.debug.assert` actually does
+
+```zig
+pub fn assert(ok: bool) void {
+    if (!ok) unreachable;
+}
+```
+
+Behavior across the four optimization modes:
+
+| Mode | `unreachable` semantics | What `assert` does |
+|---|---|---|
+| `Debug` | Panic + trace | Panics on failure |
+| `ReleaseSafe` | Panic + trace | **Panics on failure** |
+| `ReleaseFast` | UB (optimized out) | No-op on the panic side |
+| `ReleaseSmall` | UB (optimized out) | No-op on the panic side |
+
+Two consequences fall out:
+
+1. **`std.debug.assert` runs in `ReleaseSafe`, not just `Debug`.** §4's table abbreviates this to "No-op" in the ReleaseFast column, which is true for that mode — but the broader claim "removed in release" is wrong for ReleaseSafe. If you want a check to be **truly debug-only** (and inactive under any release mode, including Safe), bare `std.debug.assert` is too wide.
+
+2. **The condition expression is evaluated at the call site.** Function arguments in Zig are evaluated before the call. So `linearized.popcnt() == calls.items.len` is computed on every iteration **regardless of what `assert` does with the result**. The compiler *may* dead-code-eliminate the popcnt call in `ReleaseFast`/`ReleaseSmall` once it sees that `assert` is a no-op and `popcnt` is pure — but that's the optimizer's discretion, not a language guarantee. In `ReleaseSafe`, the popcnt is genuinely live and runs on every iteration.
+
+### Why it matters for the DFS
+
+`linearized.popcnt()` walks every chunk of the bitset and `@popCount`s each word. It's called every DFS iteration — the inner-most hot loop in the checker. Two scenarios where the bare `std.debug.assert` form bites:
+
+- **Running the perf bench under `ReleaseSafe`** (e.g. to debug a real-world history). The popcnt fires every iteration. The bench number reflects "DFS + invariant check," not the algorithm.
+- **A future change makes the condition more expensive** (a link-walk consistency check, say). The optimizer's DCE in `ReleaseFast` was relying on `popcnt` being trivially pure; a more complex predicate may not get eliminated, and the cost shows up in a release profile with no obvious source.
+
+The comptime guard removes both risks:
+
+```zig
+if (builtin.mode == .Debug) {
+    std.debug.assert(...);  // entire block is gone in any release mode
+}
+```
+
+`builtin.mode` is comptime-known; the `if` is comptime-evaluated; the block (condition *and* assert call) doesn't exist in the IR for ReleaseSafe / ReleaseFast / ReleaseSmall builds. No DCE reasoning required.
+
+### Rule of thumb for this codebase
+
+| Cost of the condition | Idiom | Modes where it runs |
+|---|---|---|
+| Cheap (single comparison, sentinel check, range test) | bare `std.debug.assert(...)` | Debug, ReleaseSafe |
+| Heavy (popcnt over chunks, link-walk, hashing, anything in a tight loop) | `if (builtin.mode == .Debug) std.debug.assert(...);` | Debug only |
+
+Concrete sites in `porcupine-zig` that follow the heavy form:
+
+- `checker.zig:667` — the `popcnt() == calls.items.len` central DFS coupling.
+- `checker.zig:336–348` — the time-sort precondition walk in `NodeArena.fromEntries`.
+- `checker.zig:186–193` — the `renumberEvents` postcondition (max id == next_id − 1).
+- `bitset.zig` — the `eqlWithBit` precondition walk over chunks.
+
+Cheap-form examples (bare `assert`) are everywhere — they're the default and dominate the file. The heavy form is reserved for invariants whose *check* would itself become a perf liability if it slipped into a release-mode path.
+
+### What §4's table should really say
+
+For completeness, the more accurate version of §4's row on `std.debug.assert`:
+
+| Mechanism | Debug | ReleaseSafe | ReleaseFast / ReleaseSmall |
+|---|---|---|---|
+| `std.debug.assert(cond)` | Evaluates `cond`, panics on false | Evaluates `cond`, panics on false | Evaluates `cond`; the panic side is a no-op (and the whole expression may be DCE'd if pure) |
+| `if (builtin.mode == .Debug) std.debug.assert(cond);` | Evaluates `cond`, panics on false | **Block removed at comptime** | **Block removed at comptime** |
+
+The takeaway: `std.debug.assert` is the right tool for invariants whose check is essentially free. `if (builtin.mode == .Debug)` is the right tool when you want a hard comptime guarantee that *neither the panic nor the condition* is in the release binary.
