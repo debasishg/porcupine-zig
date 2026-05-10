@@ -876,6 +876,26 @@ fn checkParallel(
 ) !bool {
     if (partitions.len == 0) return true;
 
+    // ------- Allocator strategy --------------------------------------------
+    // Two allocators are in play below:
+    //
+    //   1. `allocator` (parameter) — the long-lived backing allocator
+    //      threaded in from checkOperations / checkEvents. On the
+    //      multi-threaded path it is shared across worker threads, so the
+    //      caller must supply a thread-safe allocator (std.heap.smp_allocator
+    //      or std.testing.allocator qualify; a non-thread-safe GPA does not —
+    //      see WorkerCtx doc comment).
+    //
+    //   2. A short-lived `ArenaAllocator` built locally and *backed by*
+    //      `allocator`. The arena is what checkSingle actually receives;
+    //      every hot-path allocation (bitset clones, cache buckets, state
+    //      copies, calls stack) goes through it and is bulk-reclaimed by
+    //      `arena.deinit()` per partition.
+    //
+    // `allocator` is used directly only for fixed-size scratch arrays in the
+    // multi-threaded path (the WorkerCtx and std.Thread arrays); everything
+    // else routes through an arena.
+
     // ------- Single-partition fast path ------------------------------------
     // Skips all thread-dispatch overhead; the caller's thread does the work.
     // Models without partitioning (e.g. a plain register) always land here.

@@ -29,6 +29,8 @@ Wing-and-Gong style search: walk a list of pending calls in time order; greedily
 
 `makeEntries` (`src/checker.zig:86`) turns each `Operation` into two `Entry` records (a `.call` carrying the input, a `.return` carrying the output) and sorts them by time, with calls breaking ties before returns (`sortEntriesByTime`, `src/checker.zig:142`). Result: a sorted `[]Entry` of length `2n`.
 
+This stage is specific to the `checkOperations` entry point; `checkEvents` callers supply pre-formed `.call`/`.return` events and enter the pipeline at Stage 2.
+
 ## Stage 2 — build a doubly-linked list
 
 `NodeArenaOf(M).fromEntries` (`src/checker.zig:310`) lays out one flat `[]Node` (`src/checker.zig:262`):
