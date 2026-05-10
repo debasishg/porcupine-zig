@@ -28,6 +28,9 @@ tests/
 benchmarks/
   bench.zig       micro-benchmark entry point
 docs/             design notes (internal, not shipped)
+                  └── algorithm.md — canonical reference for the checker:
+                      DFS, deferred-clone cache, calls stack, debug invariants.
+                      Read first when touching checker.zig or bitset.zig.
 examples/         currently empty; reserve for user-facing examples
 ```
 
